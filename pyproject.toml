@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minillm-serve"
+version = "0.1.0"
+description = "MiniLLM-Serve：OpenAI 兼容的自研 LLM 推理服务（对标 vLLM/SGLang 的学习项目）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "torch>=2.2",
+    "transformers>=5.17,<6",
+    "accelerate>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+minillm-serve = "minillm.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: 需要下载真实模型并推理的集成测试（默认跳过）",
+]

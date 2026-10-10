@@ -1,0 +1,38 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+htmlcov/
+.coverage
+coverage.xml
+.env
+.env.*
+!.env.example
+
+# Local benchmark output can contain machine-specific paths and transient runs.
+benchmarks/results/
+
+# Model caches and weights must never enter source control.
+.cache/
+.huggingface/
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# Common private-key and local-editor files.
+*.pem
+*.key
+*.p12
+*.pfx
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

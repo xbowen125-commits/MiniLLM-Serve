@@ -1,0 +1,10 @@
+# Mission 09 container runtime versions. PyTorch is supplied by the base image.
+torch==2.11.0
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.5
+transformers==5.17.0
+accelerate==1.15.0
+# Base-image spin 0.17 requires Click <8.4 and excludes the 8.3.0 release.
+# Uvicorn requires Click >=7; Transformers' Typer dependency is also compatible.
+click>=8,<8.4,!=8.3.0

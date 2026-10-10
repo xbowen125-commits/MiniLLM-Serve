@@ -1,0 +1,42 @@
+name: minillm-serve
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: minillm-serve:0.1.0
+    platform: linux/amd64
+    init: true
+    ports:
+      - "127.0.0.1:${MINILLM_HOST_PORT:-8000}:8000"
+    environment:
+      MINILLM_MODEL: "${MINILLM_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
+      MINILLM_DEVICE: "cuda"
+      MINILLM_DTYPE: "${MINILLM_DTYPE:-float16}"
+      MINILLM_MAX_MODEL_LEN: "${MINILLM_MAX_MODEL_LEN:-2048}"
+      MINILLM_USE_KV_CACHE: "${MINILLM_USE_KV_CACHE:-true}"
+      MINILLM_MAX_CONCURRENT_GENERATIONS: "${MINILLM_MAX_CONCURRENT_GENERATIONS:-1}"
+      MINILLM_REQUEST_QUEUE_CAPACITY: "${MINILLM_REQUEST_QUEUE_CAPACITY:-8}"
+      MINILLM_QUEUE_TIMEOUT_SECONDS: "${MINILLM_QUEUE_TIMEOUT_SECONDS:-30}"
+      MINILLM_INFERENCE_TIMEOUT_SECONDS: "${MINILLM_INFERENCE_TIMEOUT_SECONDS:-180}"
+      HF_HOME: "/home/minillm/.cache/huggingface"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
+    volumes:
+      - hf-cache:/home/minillm/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    stop_signal: SIGTERM
+    # Must exceed the default inference timeout so cooperative CUDA cleanup wins.
+    stop_grace_period: 5m
+
+volumes:
+  hf-cache:
+    name: minillm-hf-cache
