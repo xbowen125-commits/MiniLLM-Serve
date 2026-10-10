@@ -24,7 +24,7 @@ def test_sample_greedy_ignores_top_p():
 
 
 def test_sample_top_k_restricts_vocab():
-    logits = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+    logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
     torch.manual_seed(0)
     for _ in range(30):
         assert int(sample(logits, temperature=1.0, top_k=2).item()) in (0, 1)
@@ -225,13 +225,21 @@ def test_pre_cancelled_request_does_not_allocate_cache():
 
 def test_consecutive_requests_use_distinct_caches():
     engine = make_engine([1, 5], use_kv_cache=True)
+    created_caches = []
+
+    def create_cache():
+        cache = FakeCache()
+        created_caches.append(cache)
+        return cache
+
+    engine._create_kv_cache = create_cache
     first = list(engine.stream_generate("first", max_tokens=1, temperature=0))
     second = list(engine.stream_generate("second", max_tokens=1, temperature=0))
 
     assert generated_text(first) == "你"
     assert generated_text(second) == "世"
-    assert len(engine.cache_refs) == 2
-    assert engine.model.calls[0]["cache_id"] != engine.model.calls[1]["cache_id"]
+    assert len(created_caches) == 2
+    assert created_caches[0] is not created_caches[1]
 
 
 def test_generation_metrics_separate_prefill_and_decode():
