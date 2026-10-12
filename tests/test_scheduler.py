@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from minillm.engine import GenerationConfig, RequestStatus
 from minillm.scheduler import (
     RequestScheduler,
     SchedulerClosed,
@@ -127,6 +128,8 @@ def make_scheduler(**overrides):
 def test_fifo_order_and_concurrency_limit(scheduler_asyncio):
     scheduler = make_scheduler()
     first = run_immediate(scheduler.acquire())
+    assert first.request_state.status is RequestStatus.RUNNING
+    assert first.request_state.request_id == str(first.request_id)
     second_wait = start_blocked(scheduler.acquire())
     third_wait = start_blocked(scheduler.acquire())
 
@@ -135,6 +138,7 @@ def test_fifo_order_and_concurrency_limit(scheduler_asyncio):
     assert snapshot["queued_requests"] == 2
 
     run_immediate(first.release("completed"))
+    assert first.request_state.status is RequestStatus.FINISHED
     second = finish(second_wait)
     assert run_immediate(scheduler.snapshot())["queued_requests"] == 1
 
@@ -145,6 +149,21 @@ def test_fifo_order_and_concurrency_limit(scheduler_asyncio):
     snapshot = run_immediate(scheduler.snapshot())
     assert snapshot["running_requests"] == 0
     assert snapshot["completed_requests"] == 3
+
+
+def test_scheduler_owns_request_state_and_generation_config(scheduler_asyncio):
+    scheduler = make_scheduler()
+    config = GenerationConfig(max_tokens=7, temperature=0.25, stream=True)
+
+    lease = run_immediate(scheduler.acquire(config))
+
+    assert lease.request_state.generation_config is config
+    assert lease.request_state.created_time <= lease.request_state.started_time
+    assert lease.request_state.finished_time is None
+
+    run_immediate(lease.release("completed"))
+    assert lease.request_state.status is RequestStatus.FINISHED
+    assert lease.request_state.finished_time >= lease.request_state.started_time
 
 
 def test_queue_full_rejects_immediately(scheduler_asyncio):
@@ -188,10 +207,16 @@ def test_waiting_request_cancellation_releases_queue_place(scheduler_asyncio):
 
 def test_running_outcomes_and_metrics(scheduler_asyncio):
     scheduler = make_scheduler()
-    for outcome in ("inference_timeout", "cancelled", "failed"):
+    expected_statuses = {
+        "inference_timeout": RequestStatus.FAILED,
+        "cancelled": RequestStatus.CANCELLED,
+        "failed": RequestStatus.FAILED,
+    }
+    for outcome, expected_status in expected_statuses.items():
         lease = run_immediate(scheduler.acquire())
         lease.cancel_event.set()
         run_immediate(lease.release(outcome))
+        assert lease.request_state.status is expected_status
     snapshot = run_immediate(scheduler.snapshot())
     assert snapshot["inference_timeout_requests"] == 1
     assert snapshot["cancelled_requests"] == 1
@@ -242,6 +267,7 @@ def test_shutdown_cancels_waiting_and_running_then_waits_for_release(scheduler_a
         {"queue_capacity": -1},
         {"queue_timeout_seconds": 0},
         {"inference_timeout_seconds": 0},
+        {"max_batch_size": 0},
     ],
 )
 def test_invalid_scheduler_configuration(kwargs):

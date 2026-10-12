@@ -17,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Settings
-from .engine import GenerationChunk, GenerationEngine, GenerationResult
+from .engine import GenerationChunk, GenerationConfig, GenerationEngine, GenerationResult
 from .scheduler import (
     RequestOutcome,
     RequestScheduler,
@@ -36,6 +36,19 @@ from .schemas import (
 )
 
 logger = logging.getLogger("minillm.server")
+
+
+def _generation_config(req: ChatCompletionRequest) -> GenerationConfig:
+    """Translate the public API request into the engine's internal options."""
+    return GenerationConfig(
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        stop=req.stop,
+        stream=req.stream,
+        seed=req.seed,
+    )
 
 
 def _package_version(name: str) -> str | None:
@@ -148,13 +161,8 @@ class _StreamSession:
         try:
             chunks = self.eng.stream_chat(
                 self.req.messages,
-                max_tokens=self.req.max_tokens,
-                temperature=self.req.temperature,
-                top_p=self.req.top_p,
-                top_k=self.req.top_k,
-                stop=self.req.stop,
-                seed=self.req.seed,
                 cancel_event=self.lease.cancel_event,
+                config=self.lease.request_state.generation_config,
             )
             for chunk in chunks:
                 if not self._put_message(("chunk", chunk)):
@@ -379,7 +387,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
 
         try:
-            lease = await current_scheduler.acquire()
+            lease = await current_scheduler.acquire(_generation_config(req))
         except SchedulerQueueFull as exc:
             return _error_response(429, str(exc), "rate_limit_error", "queue_full")
         except SchedulerQueueTimeout as exc:
@@ -409,13 +417,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             asyncio.to_thread(
                 eng.chat,
                 req.messages,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                top_k=req.top_k,
-                stop=req.stop,
-                seed=req.seed,
                 cancel_event=lease.cancel_event,
+                config=lease.request_state.generation_config,
             )
         )
         try:

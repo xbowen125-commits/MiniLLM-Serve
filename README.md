@@ -28,18 +28,23 @@ Validated locally with Qwen2.5-0.5B-Instruct on an NVIDIA GeForce RTX 5060 Lapto
 ```mermaid
 flowchart LR
     C[HTTP Client] --> API[FastAPI<br/>/v1/chat/completions]
-    API --> S[RequestScheduler<br/>bounded FIFO queue]
+    API --> S[RequestScheduler<br/>RequestState lifecycle]
+    S --> Q[RequestQueue<br/>bounded FIFO admission]
     S -->|scheduler lease| W{Response mode}
 
     W -->|stream=false| NW[asyncio.to_thread<br/>non-stream worker]
     W -->|stream=true| SW[dedicated producer thread<br/>bounded message queue]
 
-    NW --> E[GenerationEngine]
+    NW --> E[GenerationEngine<br/>request orchestration]
     SW --> E
     E --> P[Chat template + tokenizer]
-    P --> G[Handwritten prefill/decode loop]
-    G --> KV[Request-local DynamicCache]
-    G --> M[Transformers causal LM<br/>CUDA or CPU]
+    E --> RS[RequestState<br/>lifecycle and generated tokens]
+    RS --> GC[GenerationConfig<br/>request generation options]
+    P --> G[GenerationRunner<br/>prefill/decode loop]
+    RS --> G
+    G --> KV[KVCacheManager<br/>request-local DynamicCache]
+    G --> WP[WorkerProtocol]
+    WP --> M[ModelWorker<br/>Transformers forward on CUDA or CPU]
 
     NW --> JSON[chat.completion JSON]
     SW --> SSE[chat.completion.chunk SSE<br/>then DONE]
@@ -251,10 +256,12 @@ The server holds possible stop-sequence prefixes until they are safe to emit. Cl
 
 ## Request Scheduler Design
 
-Non-streaming and streaming requests share one in-process `RequestScheduler`:
+Non-streaming and streaming requests share one in-process `RequestScheduler`.
+The scheduler owns a request-local `RequestState`, while a bounded
+`RequestQueue` provides FIFO admission without retaining prompt text:
 
 1. An idle execution slot is granted immediately only when no older request is waiting.
-2. Additional requests enter a bounded `deque` and are admitted in FIFO order.
+2. Additional requests enter a bounded `RequestQueue` and are admitted in FIFO order.
 3. A full queue fails before generation with HTTP 429 and `code="queue_full"`.
 4. Queue wait timeout returns HTTP 503 and `code="queue_timeout"`.
 5. Inference timeout returns HTTP 504 for non-streaming requests. An active SSE response receives an `inference_timeout` error event.
@@ -379,7 +386,16 @@ MiniLLM-Serve/
 │   └── smoke_test.py              # Simple non-streaming HTTP probe
 ├── src/minillm/
 │   ├── config.py                  # Environment-backed settings
-│   ├── engine.py                  # Generation loop and KV Cache
+│   ├── engine/
+│   │   ├── __init__.py            # Stable public engine exports
+│   │   ├── config.py              # Internal generation options
+│   │   ├── engine.py              # Prompting and request orchestration
+│   │   ├── protocol.py            # Structural worker execution contract
+│   │   ├── request.py             # Per-request generation lifecycle state
+│   │   ├── worker.py              # Model loading and forward execution
+│   │   ├── generation.py          # Sampling and token generation loop
+│   │   └── cache.py               # Request-local KV Cache lifecycle
+│   ├── request_queue.py            # Bounded FIFO admission container
 │   ├── scheduler.py               # FIFO admission and lifecycle metrics
 │   ├── schemas.py                 # Request, response, chunk, and error models
 │   └── server.py                  # FastAPI, SSE, workers, and shutdown

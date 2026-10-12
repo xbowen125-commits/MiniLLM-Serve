@@ -98,7 +98,25 @@ class FakeEngine:
         self.error = error
         self.calls: list[dict] = []
 
-    def _record(self, messages, max_tokens, temperature, top_p, top_k, stop=None, seed=None, **extra):
+    def _record(
+        self,
+        messages,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        stop=None,
+        seed=None,
+        config=None,
+        **extra,
+    ):
+        if config is not None:
+            max_tokens = config.max_tokens
+            temperature = config.temperature
+            top_p = config.top_p
+            top_k = config.top_k
+            stop = config.stop
+            seed = config.seed
         self.calls.append(
             {
                 "messages": messages,
@@ -108,6 +126,7 @@ class FakeEngine:
                 "top_k": top_k,
                 "stop": stop,
                 "seed": seed,
+                "stream": config.stream if config is not None else None,
                 **extra,
             }
         )
@@ -115,13 +134,14 @@ class FakeEngine:
     def chat(
         self,
         messages,
-        max_tokens,
-        temperature,
-        top_p,
-        top_k,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        top_k=None,
         stop=None,
         seed=None,
         cancel_event=None,
+        config=None,
     ):
         self._record(
             messages,
@@ -131,6 +151,7 @@ class FakeEngine:
             top_k,
             stop,
             seed,
+            config=config,
             cancel_event=cancel_event,
         )
         if self.error:
@@ -140,16 +161,25 @@ class FakeEngine:
     def stream_chat(
         self,
         messages,
-        max_tokens,
-        temperature,
-        top_p,
-        top_k,
+        max_tokens=None,
+        temperature=None,
+        top_p=None,
+        top_k=None,
         stop=None,
         seed=None,
         cancel_event=None,
+        config=None,
     ):
         self._record(
-            messages, max_tokens, temperature, top_p, top_k, stop, seed, cancel_event=cancel_event
+            messages,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            stop,
+            seed,
+            config=config,
+            cancel_event=cancel_event,
         )
         if self.error:
             raise self.error
@@ -253,12 +283,14 @@ def test_chat_completions_params_forwarded():
     assert call["top_k"] == 12
     assert call["stop"] == ["END"]
     assert call["seed"] == 42
+    assert call["stream"] is False
 
 
 def test_stream_sse_headers_chunk_shape_order_and_done():
+    engine = FakeEngine()
     response = run_immediate(
         call_completion(
-            make_app(FakeEngine()),
+            make_app(engine),
             {"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": True},
         )
     )
@@ -280,6 +312,7 @@ def test_stream_sse_headers_chunk_shape_order_and_done():
     assert contents == ["你", "好"]
     assert chunks[-1]["choices"][0]["delta"] == {}
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert engine.calls[0]["stream"] is True
 
 
 def test_stream_generation_error_is_an_sse_error_then_done():

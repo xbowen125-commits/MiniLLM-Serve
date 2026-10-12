@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from typing import Literal
+
+from .engine import GenerationConfig, RequestState
+from .request_queue import RequestQueue
 
 
 class SchedulerError(RuntimeError):
@@ -45,6 +47,7 @@ class _Waiter:
     sequence: int
     enqueued_at: float
     future: asyncio.Future["SchedulerLease"]
+    request_state: RequestState
 
 
 class SchedulerLease:
@@ -55,10 +58,12 @@ class SchedulerLease:
         scheduler: "RequestScheduler",
         request_id: int,
         queue_wait_seconds: float,
+        request_state: RequestState,
     ) -> None:
         self._scheduler = scheduler
         self.request_id = request_id
         self.queue_wait_seconds = queue_wait_seconds
+        self.request_state = request_state
         self.cancel_event = threading.Event()
         self._released = False
 
@@ -82,6 +87,7 @@ class RequestScheduler:
         queue_capacity: int,
         queue_timeout_seconds: float,
         inference_timeout_seconds: float,
+        max_batch_size: int = 4,
     ) -> None:
         if max_running < 1:
             raise ValueError("max_running must be at least 1")
@@ -91,14 +97,18 @@ class RequestScheduler:
             raise ValueError("queue_timeout_seconds must be positive")
         if inference_timeout_seconds <= 0:
             raise ValueError("inference_timeout_seconds must be positive")
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be at least 1")
 
         self.max_running = max_running
         self.queue_capacity = queue_capacity
         self.queue_timeout_seconds = queue_timeout_seconds
         self.inference_timeout_seconds = inference_timeout_seconds
+        self.max_batch_size = max_batch_size
 
         self._lock = asyncio.Lock()
-        self._waiters: deque[_Waiter] = deque()
+        self._waiters = RequestQueue(queue_capacity)
+        self._waiting_metadata: dict[str, _Waiter] = {}
         self._running: dict[int, SchedulerLease] = {}
         self._next_sequence = 1
         self._closed = False
@@ -116,7 +126,10 @@ class RequestScheduler:
         self._queue_wait_total = 0.0
         self._queue_wait_max = 0.0
 
-    async def acquire(self) -> SchedulerLease:
+    async def acquire(
+        self,
+        generation_config: GenerationConfig | None = None,
+    ) -> SchedulerLease:
         """Admit immediately or wait in strict FIFO order."""
         waiter: _Waiter | None = None
 
@@ -127,16 +140,20 @@ class RequestScheduler:
 
             now = time.monotonic()
             if len(self._running) < self.max_running and not self._waiters:
-                return self._grant_locked(now, now)
+                sequence, request_state = self._new_request_locked(generation_config)
+                return self._grant_locked(sequence, request_state, now, now)
 
-            if len(self._waiters) >= self.queue_capacity:
+            if self._waiters.is_full:
                 self._rejected += 1
                 raise SchedulerQueueFull("inference request queue is full")
 
             future: asyncio.Future[SchedulerLease] = asyncio.get_running_loop().create_future()
-            waiter = _Waiter(self._next_sequence, now, future)
-            self._next_sequence += 1
-            self._waiters.append(waiter)
+            sequence, request_state = self._new_request_locked(generation_config)
+            waiter = _Waiter(sequence, now, future, request_state)
+            if not self._waiters.put(request_state):
+                self._rejected += 1
+                raise SchedulerQueueFull("inference request queue is full")
+            self._waiting_metadata[request_state.request_id] = waiter
 
         try:
             return await asyncio.wait_for(
@@ -149,6 +166,7 @@ class RequestScheduler:
                 if waiter.future.done() and not waiter.future.cancelled():
                     return waiter.future.result()
                 self._remove_waiter_locked(waiter)
+                self._cancel_request(waiter.request_state)
                 self._queue_timeouts += 1
                 waiter.future.cancel()
             raise SchedulerQueueTimeout(
@@ -161,6 +179,7 @@ class RequestScheduler:
                     admitted = waiter.future.result()
                 else:
                     self._remove_waiter_locked(waiter)
+                    self._cancel_request(waiter.request_state)
                     waiter.future.cancel()
                     self._cancelled += 1
             if admitted is not None:
@@ -200,10 +219,11 @@ class RequestScheduler:
         async with self._lock:
             if not self._closed:
                 self._closed = True
-                waiting = list(self._waiters)
-                self._waiters.clear()
+                waiting = self._waiters.drain()
                 self._cancelled += len(waiting)
-                for waiter in waiting:
+                for request_state in waiting:
+                    waiter = self._waiting_metadata.pop(request_state.request_id)
+                    self._cancel_request(request_state)
                     if not waiter.future.done():
                         waiter.future.set_exception(
                             SchedulerClosed("request scheduler is shutting down")
@@ -217,11 +237,28 @@ class RequestScheduler:
         # handlers release leases only after their worker thread has exited.
         await self._idle.wait()
 
-    def _grant_locked(self, enqueued_at: float, now: float) -> SchedulerLease:
+    def _new_request_locked(
+        self,
+        generation_config: GenerationConfig | None,
+    ) -> tuple[int, RequestState]:
         request_id = self._next_sequence
         self._next_sequence += 1
+        request_state = RequestState(
+            request_id=str(request_id),
+            generation_config=generation_config or GenerationConfig(),
+        )
+        return request_id, request_state
+
+    def _grant_locked(
+        self,
+        request_id: int,
+        request_state: RequestState,
+        enqueued_at: float,
+        now: float,
+    ) -> SchedulerLease:
         wait_seconds = max(0.0, now - enqueued_at)
-        lease = SchedulerLease(self, request_id, wait_seconds)
+        request_state.mark_running()
+        lease = SchedulerLease(self, request_id, wait_seconds, request_state)
         self._running[request_id] = lease
         self._accepted += 1
         self._idle.clear()
@@ -232,10 +269,55 @@ class RequestScheduler:
         return lease
 
     def _remove_waiter_locked(self, target: _Waiter) -> None:
-        try:
-            self._waiters.remove(target)
-        except ValueError:
-            pass
+        self._waiters.remove(target.request_state)
+        self._waiting_metadata.pop(target.request_state.request_id, None)
+
+    async def schedule_batch(self) -> list[RequestState]:
+        """Admit one FIFO batch without exceeding the execution limit."""
+        async with self._lock:
+            if self._closed:
+                return []
+            return self._schedule_batch_locked(time.monotonic())
+
+    def _schedule_batch_locked(self, now: float) -> list[RequestState]:
+        available_slots = self.max_running - len(self._running)
+        if available_slots <= 0:
+            return []
+
+        states = self._waiters.get_batch(
+            min(self.max_batch_size, available_slots)
+        )
+        scheduled: list[RequestState] = []
+        for request_state in states:
+            waiter = self._waiting_metadata.pop(request_state.request_id)
+            if waiter.future.done():
+                self._cancel_request(request_state)
+                continue
+            next_lease = self._grant_locked(
+                waiter.sequence,
+                request_state,
+                waiter.enqueued_at,
+                now,
+            )
+            waiter.future.set_result(next_lease)
+            scheduled.append(request_state)
+        return scheduled
+
+    @staticmethod
+    def _cancel_request(request_state: RequestState) -> None:
+        if not request_state.is_terminal:
+            request_state.mark_cancelled()
+
+    @staticmethod
+    def _finish_request(request_state: RequestState, outcome: RequestOutcome) -> None:
+        if request_state.is_terminal:
+            return
+        if outcome == "completed":
+            request_state.mark_finished()
+        elif outcome in {"failed", "inference_timeout"}:
+            request_state.mark_failed()
+        elif outcome == "cancelled":
+            request_state.mark_cancelled()
 
     async def _release(
         self,
@@ -245,6 +327,8 @@ class RequestScheduler:
         async with self._lock:
             if self._running.pop(lease.request_id, None) is None:
                 return
+
+            self._finish_request(lease.request_state, outcome)
 
             if outcome == "completed":
                 self._completed += 1
@@ -256,13 +340,7 @@ class RequestScheduler:
                 self._cancelled += 1
 
             if not self._closed:
-                now = time.monotonic()
-                while len(self._running) < self.max_running and self._waiters:
-                    waiter = self._waiters.popleft()
-                    if waiter.future.done():
-                        continue
-                    next_lease = self._grant_locked(waiter.enqueued_at, now)
-                    waiter.future.set_result(next_lease)
+                self._schedule_batch_locked(time.monotonic())
 
             if not self._running:
                 self._idle.set()

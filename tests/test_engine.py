@@ -215,6 +215,32 @@ def test_cancel_releases_request_cache_reference():
     assert cache_ref() is None
 
 
+def test_completed_request_releases_request_cache_reference():
+    engine = make_engine([1], use_kv_cache=True)
+
+    list(engine.stream_generate("prompt", max_tokens=1, temperature=0))
+    cache_ref = engine.cache_refs[0]
+
+    gc.collect()
+    assert cache_ref() is None
+
+
+def test_forward_error_releases_request_cache_reference():
+    engine = make_engine([1], use_kv_cache=True)
+
+    class FailingModel:
+        def __call__(self, **_kwargs):
+            raise RuntimeError("forward failed")
+
+    engine.model = FailingModel()
+    with pytest.raises(RuntimeError, match="forward failed"):
+        list(engine.stream_generate("prompt", max_tokens=1, temperature=0))
+    cache_ref = engine.cache_refs[0]
+
+    gc.collect()
+    assert cache_ref() is None
+
+
 def test_pre_cancelled_request_does_not_allocate_cache():
     engine = make_engine([1], use_kv_cache=True)
     cancel = threading.Event()
