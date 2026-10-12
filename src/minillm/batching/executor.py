@@ -88,5 +88,10 @@ class BatchExecutor:
             if result.error is not None:
                 request.mark_failed()
             elif result.finished:
-                request.mark_finished()
+                if result.finish_reason_value == "cancelled":
+                    request.mark_cancelled()
+                elif result.finish_reason_value == "error":
+                    request.mark_failed()
+                else:
+                    request.mark_finished()
             batch.step_results.append(result)

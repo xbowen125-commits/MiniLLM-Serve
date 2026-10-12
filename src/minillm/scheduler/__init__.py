@@ -14,8 +14,12 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
-from .engine import GenerationConfig, RequestState
-from .request_queue import RequestQueue
+from ..engine import GenerationConfig, RequestState
+from ..request_queue import RequestQueue
+from .phase_policy import PhaseAwareBatchPolicy, PhaseSchedulingPolicy
+from .snapshot import SchedulerSnapshot
+from .fair_policy import FairPhaseBatchPolicy
+from .priority import PhasePriority
 
 
 class SchedulerError(RuntimeError):
@@ -88,6 +92,7 @@ class RequestScheduler:
         queue_timeout_seconds: float,
         inference_timeout_seconds: float,
         max_batch_size: int = 4,
+        phase_policy: PhaseAwareBatchPolicy | None = None,
     ) -> None:
         if max_running < 1:
             raise ValueError("max_running must be at least 1")
@@ -105,6 +110,7 @@ class RequestScheduler:
         self.queue_timeout_seconds = queue_timeout_seconds
         self.inference_timeout_seconds = inference_timeout_seconds
         self.max_batch_size = max_batch_size
+        self.phase_policy = phase_policy
 
         self._lock = asyncio.Lock()
         self._waiters = RequestQueue(queue_capacity)
@@ -279,14 +285,37 @@ class RequestScheduler:
                 return []
             return self._schedule_batch_locked(time.monotonic())
 
+    async def phase_snapshot(self, *, now: float | None = None,
+                             starvation_threshold_seconds: float = 60.0) -> SchedulerSnapshot:
+        """Observe only currently owned waiting and running requests."""
+        async with self._lock:
+            requests = [waiter.request_state for waiter in self._waiting_metadata.values()]
+            waiting_requests = tuple(requests)
+            requests.extend(lease.request_state for lease in self._running.values())
+            return SchedulerSnapshot.from_requests(
+                requests,
+                self.phase_policy or PhaseSchedulingPolicy(),
+                active_batch_size=len(self._running),
+                now=now,
+                starvation_threshold_seconds=starvation_threshold_seconds,
+                waiting_requests=waiting_requests,
+            )
+
     def _schedule_batch_locked(self, now: float) -> list[RequestState]:
         available_slots = self.max_running - len(self._running)
         if available_slots <= 0:
             return []
 
-        states = self._waiters.get_batch(
-            min(self.max_batch_size, available_slots)
-        )
+        limit = min(self.max_batch_size, available_slots)
+        if self.phase_policy is None:
+            states = self._waiters.get_batch(limit)
+        else:
+            states = self.phase_policy.select_batch(
+                [waiter.request_state for waiter in self._waiting_metadata.values()],
+                limit,
+            )
+            for state in states:
+                self._waiters.remove(state)
         scheduled: list[RequestState] = []
         for request_state in states:
             waiter = self._waiting_metadata.pop(request_state.request_id)
