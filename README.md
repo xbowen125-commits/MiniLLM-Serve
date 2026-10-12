@@ -1,108 +1,200 @@
 # MiniLLM-Serve
 
-## Project Overview
+A compact LLM inference service and offline runtime research playground.
+Explore scheduling, prefill/decode execution and KV ownership without hiding
+the mechanics behind a production serving framework.
 
-MiniLLM-Serve is a compact, OpenAI-compatible LLM inference service built to make the internals of model serving visible and understandable. It combines a handwritten autoregressive generation loop, request-local KV caching, SSE streaming, and a bounded FIFO scheduler in a small FastAPI codebase.
+## Overview
 
-The project targets hands-on AI infrastructure and inference engineering study. It is intentionally smaller than production systems such as vLLM or SGLang: the goal is to expose the mechanics of prefill, decode, cache lifetime, cancellation, queueing, and measurement without hiding them behind a large serving framework.
+The project separates two paths:
 
-Validated locally with Qwen2.5-0.5B-Instruct on an NVIDIA GeForce RTX 5060 Laptop GPU, PyTorch 2.11.0+cu128, CUDA 12.8, Transformers 5.17.0, and Accelerate 1.15.0.
+- **Online serving:** FastAPI, an OpenAI-compatible text Chat Completions subset,
+  incremental SSE, handwritten autoregressive decoding, request-local KV cache
+  and bounded FIFO admission.
+- **Offline research:** model-independent runtime contracts, explicit request
+  ownership, continuous decode-step coordination, experimental workers,
+  simulated paged KV capacity and reproducible benchmark experiments.
 
-## Key Features
+MiniLLM-Serve is an educational engineering project, **not a production vLLM
+replacement**. Offline experiments are not wired into the HTTP inference path.
 
-- OpenAI-style `POST /v1/chat/completions` endpoint.
-- Non-streaming JSON responses with prompt, completion, and total token usage.
-- Real incremental SSE streaming with `chat.completion.chunk` objects and a final `[DONE]` event.
-- Handwritten batch-size-1 autoregressive generation with temperature, top-k, top-p, stop sequences, seeds, and length limits.
-- Request-local Transformers `DynamicCache`: full-prompt prefill followed by single-token decode.
-- Runtime KV Cache on/off switch for correctness and performance comparisons.
-- Strict FIFO request admission with bounded queue capacity and configurable GPU concurrency.
-- Separate queue and inference timeouts, cooperative cancellation, and client-disconnect cleanup.
-- Prompt-free `/health` and `/scheduler/status` observability endpoints.
-- Engine, HTTP, and bounded stability benchmark tools with JSON, CSV, and Markdown output.
-- Single-worker NVIDIA GPU container, non-root runtime user, persistent Hugging Face cache, and graceful SIGTERM shutdown.
-- Mock-based CPU test suite; normal tests do not download a model.
+Historical online validation used Qwen2.5-0.5B-Instruct on an RTX 5060 Laptop GPU,
+PyTorch 2.11.0+cu128, CUDA 12.8, Transformers 5.17.0 and Accelerate 1.15.0.
+See [published evidence](benchmarks/reports/benchmark-summary.md) and
+[environment notes](benchmarks/reports/environment.md). These measurements do
+not validate every later experimental backend.
 
-## System Architecture
+## Architecture
 
 ```mermaid
-flowchart LR
-    C[HTTP Client] --> API[FastAPI<br/>/v1/chat/completions]
-    API --> S[RequestScheduler<br/>RequestState lifecycle]
-    S --> Q[RequestQueue<br/>bounded FIFO admission]
-    S -->|scheduler lease| W{Response mode}
-
-    W -->|stream=false| NW[asyncio.to_thread<br/>non-stream worker]
-    W -->|stream=true| SW[dedicated producer thread<br/>bounded message queue]
-
-    NW --> E[GenerationEngine<br/>request orchestration]
-    SW --> E
-    E --> P[Chat template + tokenizer]
-    E --> RS[RequestState<br/>lifecycle and generated tokens]
-    RS --> GC[GenerationConfig<br/>request generation options]
-    P --> G[GenerationRunner<br/>prefill/decode loop]
-    RS --> G
-    G --> KV[KVCacheManager<br/>request-local DynamicCache]
-    G --> WP[WorkerProtocol]
-    WP --> M[ModelWorker<br/>Transformers forward on CUDA or CPU]
-
-    NW --> JSON[chat.completion JSON]
-    SW --> SSE[chat.completion.chunk SSE<br/>then DONE]
-
-    API --> H["GET /health"]
-    API --> O["GET /scheduler/status"]
-    X[Timeout / disconnect / shutdown] -. cancel event .-> W
-    W -. release only after worker exits .-> S
+flowchart TB
+    subgraph Online[Online serving]
+        Client[HTTP client] --> API[FastAPI: JSON or SSE]
+        API --> Scheduler[RequestScheduler: FIFO and leases]
+        Scheduler --> Engine[GenerationEngine]
+        Engine --> Runner[GenerationRunner]
+        Runner --> Model[ModelWorker: Transformers forward]
+        Runner --> Cache[Request-local DynamicCache]
+    end
+    subgraph Offline[Offline runtime research]
+        Facade[RuntimeFacade] --> Coordinator[DecodeCoordinator]
+        Continuous[ContinuousBatchExecutor] --> Plan[Scheduler and Step Plan]
+        Plan --> Coordinator
+        Coordinator --> Context[RuntimeRequestContext]
+        Context --> Request[RequestState: lifecycle and tokens]
+        Context --> Decode[DecodeState: execution observations]
+        Coordinator --> Manager[ExecutionManager]
+        Manager --> Executors[PrefillExecutor and DecodeExecutor]
+        Executors --> Protocol[ExecutionWorkerProtocol]
+        Protocol --> Workers[FakeWorker or TransformersWorker]
+        Plan --> BatchProtocol[ContinuousBatchWorkerProtocol]
+        BatchProtocol --> BatchWorker[FakeWorker or experimental CPU Batch Worker]
+        BatchProtocol --> PagedWorker[PagedContinuousBatchWorker decorator]
+        PagedWorker --> Backend[Wrapped batch backend]
+        PagedWorker --> Paged[PagedKVCacheManager: simulation]
+        Paged --> Store[KVCacheStore]
+        Store --> Table[BlockTable]
+        Store --> Memory[KVMemoryManager]
+    end
+    Contracts[contracts: shared phases and results] -. types .-> Coordinator
+    Experiments[Benchmark experiments] -. observe .-> Offline
 ```
 
-The FastAPI event loop never performs model inference directly. Non-streaming work runs through `asyncio.to_thread`; streaming uses one producer thread per admitted request and transfers chunks through a bounded thread-safe queue. A scheduler slot remains occupied until the physical worker has exited, including timeout and cancellation paths.
+The offline paths are alternatives, not additional HTTP pipeline stages.
+Synthetic block IDs never enter model attention.
 
-## Quick Start with Docker Compose
+## Features
 
-### Prerequisites
+| Area | Capability | Boundary |
+| --- | --- | --- |
+| API | JSON completions, token usage, incremental SSE and `[DONE]` | Online text subset |
+| Generation | Temperature, top-k/top-p, stop sequences, seeds and length limits | Batch-size-1 online engine |
+| KV cache | Full-prompt prefill, single-token decode, request-local DynamicCache and cache toggle | Online |
+| Request management | FIFO, bounded queues, timeouts, cancellation and shutdown cleanup | Online |
+| Runtime Architecture | Shared contracts, phase validation, context ownership, error isolation and snapshots | Offline |
+| Continuous Batching | Persistent Decode requests, Prefill admission, step plans and batch-worker contracts | Offline coordination |
+| Backend experiments | Sequential Transformers worker and CPU batch adapter limited to two requests | Offline; batch adapter primarily fake-model tested |
+| KV Memory System | Capacity limits, blocks, logical mappings, token growth and release accounting | Pure Python simulation |
+| Paged KV Runtime | Paged worker decorator and ordered attention block lookup | No paged attention computation |
+| Deployment | Non-root GPU container, one Uvicorn worker, cache volume and readiness check | Online |
+| Benchmark Experiments | Engine, HTTP, runtime, memory and scheduling tools | Separate measurement scopes |
 
-- Windows with WSL2 and Docker Desktop using Linux containers.
-- A current NVIDIA Windows driver with WSL2 GPU support.
-- Docker Compose with NVIDIA GPU device reservations.
-- Enough disk space for the CUDA runtime image and model cache.
+## Design Details
 
-Run all commands from the cloned project root in Windows PowerShell.
+### Online scheduler and streaming
+
+JSON and SSE requests share one process-local scheduler, defaulting to one
+concurrent generation and eight waiting requests. Queue full returns HTTP 429,
+queue timeout 503, and non-streaming inference timeout 504. Once SSE headers
+are sent, failures use error events rather than a new HTTP status.
+
+Inference runs outside the FastAPI event loop: `asyncio.to_thread` for JSON,
+a producer thread and bounded thread-safe queue for SSE. Cancellation is
+cooperative between model steps. **Execution leases remain held until the actual
+worker exits**, because active CUDA kernels cannot be forcibly interrupted.
+`/health` and `/scheduler/status` expose readiness and aggregate state without
+running inference or publishing prompt content.
+
+### Runtime Architecture
+
+`RuntimeFacade` provides offline `submit`, `step`, `cancel`, `snapshot`,
+`get_result` and `close`. `RuntimeRequestContext` combines a single authoritative
+`RequestState` (lifecycle, generated tokens and options), an execution-only
+`DecodeState` (phase, timestamps and counters), and derived metrics.
+Legacy exports remain adapters rather than independent lifecycle owners.
+
+`ExecutionManager` delegates to phase-specific executors that validate phases,
+result types and request-ID completeness. `DecodeCoordinator` applies results,
+isolates request failures, distinguishes whole-worker errors and monitors
+decode progress. Execution phases are separate from lifecycle status.
+
+### Continuous Batching
+
+The offline executor retains unfinished Decode requests and admits waiting
+Prefill requests into available slots. Stable step plans map results to request
+IDs; one request finishing does not stop its peers.
+
+This is **logical continuous batch coordination**, not production GPU continuous
+batching. The experimental `TransformersBatchWorker` supports CPU batches of
+at most two requests using basic K/V concatenation and cloned row splitting.
+It is correctness scaffolding, not an optimized cache layout, and is not
+connected to HTTP. The existing `TransformersWorker` remains a separate
+sequential-request backend.
+
+### KV Memory System and Paged KV Runtime
+
+`KVMemoryManager` accounts for synthetic byte capacity. `BlockTable` maps logical
+sequence blocks to physical IDs in order. `KVCacheStore` maintains consistent
+token counts, mappings and capacity; `PagedKVCacheManager` grows fixed-size pages.
+
+`PagedContinuousBatchWorker` wraps a backend to reserve prompt pages, validate
+decode lookup, grow accounting after a token and release on completion/error.
+Callers own cleanup: close the wrapper after executor shutdown.
+`PagedAttentionSimulator` only returns ordered block IDs. **Neither component
+allocates GPU tensors or computes paged attention.**
+
+### Scheduling policies
+
+Online admission remains FIFO by default. Offline comparisons use FIFO,
+Decode-first phase priority and Fair Aging. Aging adds request creation age to
+phase weights (Decode 100, Prefill 50, Waiting 10), with FIFO tie-breaking.
+Creation age is not time since the last token; aging does not guarantee bounded
+waiting under arbitrary sustained load.
+
+## Quick Start
+
+### Docker Compose — Windows PowerShell
+
+Requires Docker Desktop with Linux containers and WSL2, an NVIDIA driver with
+WSL2 GPU support, and Compose GPU device reservations. Run from the project root:
 
 ```powershell
 docker version
 docker compose version
-
-docker run --rm --gpus all `
-  pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime `
-  python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
-```
-
-Build and start the service:
-
-```powershell
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 docker compose config
-docker compose build --progress=plain
+docker compose build
 docker compose up -d
 docker compose logs -f api
 ```
 
-Compose publishes the service only on `127.0.0.1:8000` by default. Set `MINILLM_HOST_PORT` in `.env` if the host port is already in use.
+Default address: **`127.0.0.1:8000`**. Compose selects Qwen2.5-0.5B-Instruct,
+CUDA FP16 and one Uvicorn worker. Additional workers load independent models and
+schedulers. The container uses `/opt/venv` and reuses the base CUDA PyTorch.
+Change `MINILLM_HOST_PORT` in `.env` if needed.
 
-Wait for model loading and inspect service state:
+First startup may download the public model into the persistent
+`minillm-hf-cache` volume. Tokens belong only in the runtime environment;
+never commit `.env` or bake credentials into an image.
 
 ```powershell
-py -3 scripts\docker_smoke.py `
-  --base-url http://127.0.0.1:8000 `
-  --expect-device cuda
-
 Invoke-RestMethod http://127.0.0.1:8000/health
 Invoke-RestMethod http://127.0.0.1:8000/scheduler/status
+py -3 scripts\docker_smoke.py --base-url http://127.0.0.1:8000 --expect-device cuda
 ```
 
-The first start may download the configured public model. Hugging Face files are retained in the `minillm-hf-cache` named volume and are not copied into the image. For a private model, pass `HF_TOKEN` only through the runtime environment; never add it to the Dockerfile or source control.
+Wait for `loaded: true`. Send a completion request from another terminal:
 
-Gracefully stop the service:
+```powershell
+$payload = @{
+    model = "Qwen/Qwen2.5-0.5B-Instruct"
+    messages = @(@{ role = "user"; content = "Explain KV cache briefly." })
+    max_tokens = 64
+    temperature = 0.0
+    stream = $false
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Uri http://127.0.0.1:8000/v1/chat/completions `
+    -Method Post -ContentType application/json -Body $payload
+
+# Stream JSON through stdin to avoid native-command quoting differences.
+$payload = $payload -replace '"stream":\s*false', '"stream": true'
+$payload | curl.exe --no-buffer -X POST http://127.0.0.1:8000/v1/chat/completions `
+    -H "Content-Type: application/json" --data-binary '@-'
+```
+
+SSE emits assistant-role metadata, incremental `chat.completion.chunk` content,
+a finish-reason chunk and `[DONE]`. SSE chunk count is not token count.
 
 ```powershell
 docker compose stop -t 300
@@ -110,332 +202,122 @@ docker compose logs --tail 100 api
 docker compose down
 ```
 
-`docker compose down` preserves the model cache. `docker compose down -v` also deletes the cache volume.
+`down` preserves cached models; adding `-v` deletes the cache volume.
 
-## Local Development
+### Local development
 
-Python 3.10 or later is required. The container and CI configuration use Python 3.12. Install the PyTorch build appropriate for the target machine before installing the project.
-
-Example Windows CUDA environment:
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip
-python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install -e ".[dev]"
-```
-
-Start the service locally:
+Metadata requires Python 3.10+; Docker and CI target Python 3.12. For a new
+environment, install the appropriate CPU/CUDA PyTorch build before
+`python -m pip install -e ".[dev]"`. Preserve an existing `.venv`.
 
 ```powershell
 $env:MINILLM_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 $env:MINILLM_DEVICE = "cuda"
 $env:MINILLM_DTYPE = "float16"
 $env:MINILLM_USE_KV_CACHE = "true"
-$env:MINILLM_MAX_CONCURRENT_GENERATIONS = "1"
-$env:MINILLM_REQUEST_QUEUE_CAPACITY = "8"
-$env:MINILLM_QUEUE_TIMEOUT_SECONDS = "30"
-$env:MINILLM_INFERENCE_TIMEOUT_SECONDS = "180"
-
-.\.venv\Scripts\python.exe -m uvicorn minillm.server:app `
-  --host 127.0.0.1 `
-  --port 8000
+.\.venv\Scripts\python.exe -m uvicorn minillm.server:app --host 127.0.0.1 --port 8000
 ```
 
-The model is loaded during FastAPI startup. Do not send inference requests until `/health` reports `loaded: true`.
+Application model default is Qwen2.5-1.5B-Instruct, unlike Compose. Configuration
+references: [.env.example](.env.example) and [config.py](src/minillm/config.py).
 
-Core environment variables:
+## Benchmarks
 
-| Variable | Application default | Docker Compose default | Purpose |
-| --- | --- | --- | --- |
-| `MINILLM_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` | `Qwen/Qwen2.5-0.5B-Instruct` | Hugging Face model ID or local path |
-| `MINILLM_DEVICE` | `auto` | `cuda` | `auto`, `cpu`, `cuda`, or a device string |
-| `MINILLM_DTYPE` | `auto` | `float16` | PyTorch dtype name |
-| `MINILLM_MAX_MODEL_LEN` | `2048` | `2048` | Prompt plus generated-token limit |
-| `MINILLM_USE_KV_CACHE` | `true` | `true` | Enable request-local KV Cache |
-| `MINILLM_MAX_CONCURRENT_GENERATIONS` | `1` | `1` | Simultaneous admitted generation workers |
-| `MINILLM_REQUEST_QUEUE_CAPACITY` | `8` | `8` | Waiting requests, excluding running requests |
-| `MINILLM_QUEUE_TIMEOUT_SECONDS` | `30` | `30` | Maximum wait for a scheduler slot |
-| `MINILLM_INFERENCE_TIMEOUT_SECONDS` | `120` | `180` | Execution timeout after admission |
-
-## OpenAI-Compatible API Examples
-
-MiniLLM-Serve implements the text Chat Completions subset at `POST /v1/chat/completions`.
-
-### Non-streaming request
-
-```powershell
-$body = @{
-    model = "Qwen/Qwen2.5-0.5B-Instruct"
-    messages = @(
-        @{ role = "system"; content = "Answer concisely." }
-        @{ role = "user"; content = "用一句话解释 KV Cache。" }
-    )
-    max_tokens = 64
-    temperature = 0.0
-    top_p = 1.0
-    top_k = -1
-    seed = 42
-    stream = $false
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod `
-  -Uri http://127.0.0.1:8000/v1/chat/completions `
-  -Method Post `
-  -ContentType application/json `
-  -Body $body
-```
-
-Response shape:
-
-```json
-{
-  "id": "chatcmpl-...",
-  "object": "chat.completion",
-  "created": 0,
-  "model": "Qwen/Qwen2.5-0.5B-Instruct",
-  "choices": [
-    {
-      "index": 0,
-      "message": {"role": "assistant", "content": "..."},
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0
-  }
-}
-```
-
-Supported request fields:
-
-| Field | Default | Validation / behavior |
-| --- | ---: | --- |
-| `model` | required | Must match the loaded model |
-| `messages` | required | Non-empty `system`, `user`, and `assistant` message list |
-| `max_tokens` | `512` | 1–4096, additionally bounded by `MINILLM_MAX_MODEL_LEN` |
-| `temperature` | `0.7` | 0–2; zero selects greedy decoding |
-| `top_p` | `1.0` | 0–1 |
-| `top_k` | `-1` | `-1` disables top-k filtering |
-| `stop` | `null` | One string or 1–4 non-empty strings |
-| `seed` | `null` | Request-local PyTorch generator seed |
-| `stream` | `false` | Return JSON or SSE chunks |
-
-Admission errors use an OpenAI-style error envelope. Queue saturation returns HTTP 429, queue timeout returns HTTP 503, and non-streaming inference timeout returns HTTP 504.
-
-## SSE Streaming
-
-Streaming uses the same token-generation loop as non-streaming inference. Content is emitted only after a model forward step; the server does not generate a complete answer and split it afterward.
-
-Use unbuffered curl to observe events as they arrive:
-
-```powershell
-curl.exe --no-buffer `
-  -X POST http://127.0.0.1:8000/v1/chat/completions `
-  -H "Content-Type: application/json" `
-  --data-binary '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"用三句话介绍大模型推理。"}],"max_tokens":96,"temperature":0.7,"stream":true}'
-```
-
-Event sequence:
-
-```text
-data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"},"finish_reason":null}],...}
-
-data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"..."},"finish_reason":null}],...}
-
-data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}],...}
-
-data: [DONE]
-```
-
-The server holds possible stop-sequence prefixes until they are safe to emit. Client disconnects set a request-local cancellation event. If an error occurs after SSE headers have been sent, the stream emits an error event followed by `[DONE]`; the HTTP status can no longer be changed at that point.
-
-## Request Scheduler Design
-
-Non-streaming and streaming requests share one in-process `RequestScheduler`.
-The scheduler owns a request-local `RequestState`, while a bounded
-`RequestQueue` provides FIFO admission without retaining prompt text:
-
-1. An idle execution slot is granted immediately only when no older request is waiting.
-2. Additional requests enter a bounded `RequestQueue` and are admitted in FIFO order.
-3. A full queue fails before generation with HTTP 429 and `code="queue_full"`.
-4. Queue wait timeout returns HTTP 503 and `code="queue_timeout"`.
-5. Inference timeout returns HTTP 504 for non-streaming requests. An active SSE response receives an `inference_timeout` error event.
-6. Waiting-task cancellation removes the waiter. Running cancellation sets a `threading.Event` checked between generation steps.
-7. A CUDA kernel cannot be forcibly interrupted. The scheduler lease is released only after the underlying worker thread actually exits.
-8. Shutdown closes admission, cancels queued/running work cooperatively, and waits for all running leases to settle.
-
-Successful responses expose:
-
-- `X-MiniLLM-Request-ID`
-- `X-MiniLLM-Queue-Wait-Ms`
-
-`GET /scheduler/status` reports running and queued requests, outcomes, wait-time aggregates, shutdown state, and available CUDA memory statistics. It does not store prompts or generated content.
-
-## Benchmarks and Stress Tests
-
-Published, privacy-reviewed evidence is available in the [benchmark summary](benchmarks/reports/benchmark-summary.md) and [environment and reproduction notes](benchmarks/reports/environment.md). The values are historical local snapshots recorded on 2026-10-09 and 2026-10-10; re-run the tools on the checked-out revision before using them for capacity decisions.
-
-Benchmark tooling is split by measurement scope:
-
-| Tool | Scope | Main metrics |
+| Experiment | Measurement scope | Documentation / entry point |
 | --- | --- | --- |
-| `benchmark_kv_cache.py` | Model engine | Prefill, TTFT, TPOT, tokens/s, total generation time, CUDA peak memory |
-| `benchmark_http.py` | HTTP client | E2E, streaming TTFT/TPOT, P50/P95/P99, request throughput, queue wait |
-| `stress_http.py` | Stability | Success/error counts, rejection/timeout/cancellation, FIFO observation, cache isolation, final scheduler idle state |
+| Engine KV comparison | Real prefill/decode, TTFT, TPOT, throughput, CUDA peaks | [Benchmark guide](benchmarks/README.md) |
+| HTTP and stress | Client latency, queue wait, disconnects and idle cleanup | [Benchmark guide](benchmarks/README.md) |
+| Runtime Benchmark v2 | Fake-worker lifecycle and virtual scheduling | [Runtime guide](benchmarks/runtime/README.md) |
+| Real offline worker | Sequential real-model prefill/decode; local cache required | [Real-worker guide](benchmarks/runtime/real_model/README.md) |
+| Paged vs contiguous KV | Token capacity utilization and tail waste, not GPU bytes | [Experiment](benchmarks/runtime/paged_memory/experiment.py) |
+| Continuous batch | Sequential vs step-level coordination under virtual costs | [Runner](benchmarks/runtime/continuous_batch/runner.py) |
+| Scheduler research | FIFO vs phase priority vs aging, wait percentiles and fairness | [Runner](benchmarks/runtime/scheduler_research/runner.py) |
 
-SSE chunks are not treated as tokens. The HTTP benchmark reconstructs generated text and tokenizes it locally; non-streaming token counts come from the API `usage` object.
-
-Example bounded HTTP benchmark:
-
-```powershell
-.\.venv\Scripts\python.exe benchmarks\benchmark_http.py `
-  --base-url http://127.0.0.1:8000 `
-  --model Qwen/Qwen2.5-0.5B-Instruct `
-  --prompt-lengths 32,256 `
-  --generation-lengths 16,64 `
-  --concurrency 1,2,4,8 `
-  --mode both `
-  --kv-cache-state on `
-  --warmup 2 `
-  --repeats 10 `
-  --max-total-requests 500 `
-  --output-prefix benchmarks\results\http-kv-on
-```
-
-Example bounded stability run:
+Run the latest simulations without loading a model:
 
 ```powershell
-.\.venv\Scripts\python.exe benchmarks\stress_http.py `
-  --base-url http://127.0.0.1:8000 `
-  --model Qwen/Qwen2.5-0.5B-Instruct `
-  --requests 20 `
-  --concurrency 4 `
-  --disconnect-requests 2 `
-  --prompt-tokens 64 `
-  --max-tokens 64 `
-  --timeout 180 `
-  --cleanup-timeout 30
+.\.venv\Scripts\python.exe -m benchmarks.runtime.paged_memory.report
+.\.venv\Scripts\python.exe -m benchmarks.runtime.continuous_batch.report
+.\.venv\Scripts\python.exe -m benchmarks.runtime.scheduler_research.report
 ```
 
-Local validation evidence:
+JSON and Markdown are written under Git-ignored `benchmarks/runtime/results/`.
+Reports record configuration, metric definitions and limitations. Simulated
+batch speedups depend on assumed costs; scheduler TTFT is synthetic. Jain
+fairness on inverse slowdown is not a production QoS guarantee. Neither batch
+execution nor aging is presumed universally better.
 
-- Hardware: NVIDIA GeForce RTX 5060 Laptop GPU.
-- Engine benchmark: Qwen2.5-0.5B-Instruct, FP16, greedy decoding, 2 warmups and 10 measured repetitions per case.
-- HTTP acceptance run: 18/18 measured requests succeeded.
-- Stability run: 20/20 load requests succeeded; 2/2 client disconnects were observed as scheduler cancellations.
-- FIFO observation, consecutive-request KV Cache isolation, and final scheduler idle checks passed.
-- Docker validation completed for image build, `pip check`, health, Chinese non-streaming inference, a 76-chunk SSE response ending in `[DONE]`, and graceful Uvicorn shutdown.
-
-One representative engine comparison from that machine:
-
-| Prompt tokens | Max new tokens | KV Cache | TTFT | TPOT | Tokens/s | Total | CUDA peak increment |
-| ---: | ---: | :---: | ---: | ---: | ---: | ---: | ---: |
-| 32 | 16 | Off | 24.24 ms | 24.65 ms | 40.27 | 397.35 ms | 27.03 MB |
-| 32 | 16 | On | 24.68 ms | 22.72 ms | 42.52 | 376.33 ms | 10.06 MB |
-
-These are local samples, not universal hardware claims. Laptop power limits, thermals, model choice, prompt length, and repetition count materially affect results. See [benchmarks/README.md](benchmarks/README.md) for tool usage and metric definitions. Raw generated results are intentionally Git-ignored because they can contain machine-specific data; only the curated reports under `benchmarks/reports/` are publication artifacts. The historical artifacts do not include a Git commit SHA, so they cannot be cryptographically tied to the current source revision.
+Historical evidence includes 18/18 successful HTTP requests, 20/20 successful
+stress requests, 2/2 disconnect cancellations, FIFO/cache isolation and final
+idle checks. Docker build, health, Chinese inference, a 76-chunk SSE response
+ending in `[DONE]`, and graceful shutdown were manually recorded. See
+[published evidence](benchmarks/reports/benchmark-summary.md) for separate scopes
+and source artifacts. Those artifacts lack a source commit SHA and do not
+establish current-revision production capacity.
 
 ## Testing
 
-The default suite uses mocks or small tensors and does not download a model:
-
 ```powershell
+.\.venv\Scripts\python.exe -m compileall -q src tests benchmarks
 .\.venv\Scripts\python.exe -m pytest -m "not slow" -q
 ```
 
-Current local baseline:
+Last local check before this documentation-only update: **333 passed,
+9 deselected**. This is not a claim that the README update was retested or that
+GitHub-hosted CI passed. CI configures CPU PyTorch on Ubuntu/Python 3.12;
+current hosted-run status requires independent verification.
 
-```text
-78 passed, 4 deselected
-```
-
-The suite covers request validation, sampling, incremental decoding, KV Cache on/off equivalence, cache isolation, stop sequences, FIFO order, queue capacity, queue and inference timeouts, cancellation, disconnect cleanup, shutdown, SSE structure, error envelopes, benchmark math, and deployment contracts.
-
-Real-model integration tests require an available model cache or network access:
-
-```powershell
-$env:MINILLM_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-$env:MINILLM_TEST_DEVICE = "cuda"
-$env:HF_HUB_OFFLINE = "1"
-$env:TRANSFORMERS_OFFLINE = "1"
-
-.\.venv\Scripts\python.exe -m pytest -m slow tests\test_integration.py -v
-```
-
-The current local CUDA integration baseline is 4 passed tests. GitHub Actions is configured to install CPU-only PyTorch and run the non-slow suite on Ubuntu with Python 3.12; the workflow has not yet been validated on a hosted GitHub runner.
+Normal tests use mocks or small tensors without downloading models. Opt-in
+real-model tests require a complete local cache; see
+[real runtime tests](tests/test_real_kv_runtime.py) and the real-worker guide.
 
 ## Project Structure
 
 ```text
-MiniLLM-Serve/
-├── .github/workflows/ci.yml       # CPU-only GitHub Actions workflow
-├── benchmarks/
-│   ├── benchmark_http.py          # HTTP/SSE latency and throughput
-│   ├── benchmark_kv_cache.py      # Engine-side cache comparison
-│   ├── benchmark_utils.py         # Metrics and report exporters
-│   ├── stress_http.py             # Bounded stability probe
-│   └── README.md
-├── scripts/
-│   ├── docker_smoke.py            # Read-only readiness check
-│   ├── run_generation.py          # Early direct-generation learning script
-│   └── smoke_test.py              # Simple non-streaming HTTP probe
-├── src/minillm/
-│   ├── config.py                  # Environment-backed settings
-│   ├── engine/
-│   │   ├── __init__.py            # Stable public engine exports
-│   │   ├── config.py              # Internal generation options
-│   │   ├── engine.py              # Prompting and request orchestration
-│   │   ├── protocol.py            # Structural worker execution contract
-│   │   ├── request.py             # Per-request generation lifecycle state
-│   │   ├── worker.py              # Model loading and forward execution
-│   │   ├── generation.py          # Sampling and token generation loop
-│   │   └── cache.py               # Request-local KV Cache lifecycle
-│   ├── request_queue.py            # Bounded FIFO admission container
-│   ├── scheduler.py               # FIFO admission and lifecycle metrics
-│   ├── schemas.py                 # Request, response, chunk, and error models
-│   └── server.py                  # FastAPI, SSE, workers, and shutdown
-├── tests/                         # Unit, integration, benchmark, deployment tests
-├── .dockerignore
-├── .env.example
-├── .gitignore
-├── compose.yaml
-├── constraints-container.txt
-├── Dockerfile
-├── LICENSE
-├── pyproject.toml
-└── README.md
+src/minillm/
+  server.py, schemas.py, config.py  Online HTTP and settings
+  engine/                         Existing generation and cache lifecycle
+  scheduler/, request_queue.py    Admission and optional phase policies
+  contracts/                      Shared phases, results and statuses
+  runtime/                        Context ownership, adapters and facade
+  execution/                      Prefill/decode contracts and executors
+  batching/                       Coordinator, metrics and snapshots
+  continuous/                     Persistent batches, plans and paged decorator
+  workers/                        Experimental Transformers backends
+  memory/                         Simulated blocks, tables and paged lookup
+benchmarks/
+  reports/                        Curated historical evidence
+  runtime/                        Offline experiments and report generators
+tests/                            Unit, slow integration and deployment tests
+scripts/                          Smoke and generation helpers
 ```
 
-## Known Limitations
+## Limitations
 
-- Text-only Chat Completions subset: no tool calls, multimodal input, logprobs, or streaming usage object.
-- Batch size 1 and one handwritten decode loop per admitted request; no continuous batching or request merging.
-- Dynamic KV Cache only; no StaticCache, PagedAttention, prefix caching, or cross-request cache reuse.
-- The scheduler is process-local. Multiple Uvicorn workers would load independent models and independent queues; the Docker image intentionally uses one worker.
-- Cancellation is cooperative between model steps. An active CUDA kernel cannot be interrupted immediately.
-- Once SSE headers are sent, generation errors must be represented as SSE error events rather than a new HTTP status.
-- Metrics are in-memory and reset on process restart; there is no Prometheus exporter or persistent telemetry backend.
-- No built-in authentication or TLS. Docker Compose binds to `127.0.0.1` by default; use a secured reverse proxy before any network exposure.
-- The published container target is Linux/amd64 with one NVIDIA GPU.
-- Model loading occurs during application startup, and an uncached first start may require a Hugging Face download.
+- Offline research is not connected to online serving; online requests use
+  separate handwritten batch-size-1 decode loops.
+- No real GPU continuous batching, paged attention kernel, prefix sharing,
+  tensor parallelism or multi-GPU execution.
+- Simulated block capacity is not GPU allocation; block lookup is not attention.
+- Experimental CPU batching supports at most two requests and limited cache layouts.
+- Text-only Chat Completions subset: no tools, multimodal input, logprobs or
+  streaming usage object.
+- Cooperative cancellation cannot stop active CUDA kernels immediately.
+- No built-in authentication or TLS. Keep loopback binding and secure external exposure.
+- In-memory metrics reset on restart. Laptop samples and finite simulations do
+  not establish production throughput, starvation freedom or long-run reliability.
 
 ## Roadmap
 
-- Static KV Cache experiments and more detailed prefill/decode profiling.
-- Continuous batching and token-budget-aware admission control.
-- Paged KV memory management and prefix-cache experiments.
-- Prometheus-compatible metrics, structured tracing, and longer soak tests.
-- Optional authentication, request-size limits, and hardened reverse-proxy examples.
-- Broader OpenAI API compatibility, including streaming usage and tool-call schemas.
-- Multi-GPU execution only after the single-GPU lifecycle remains observable and testable.
+- Broaden experimental backend compatibility and real-model batch correctness evidence.
+- Record source revisions and expand reproducible runtime workloads.
+- Study token budgets, cache pressure and fairness before online integration.
+- Explore actual paged tensor layouts and attention backends separately from bookkeeping.
+- Add longer soak tests, structured tracing and hardened deployment examples.
+- Consider broader API compatibility and multi-GPU work after lifecycle correctness.
+
+These are research directions, not implemented features or performance promises.
 
 ## License
 
-MiniLLM-Serve is released under the [MIT License](LICENSE).
-
-Copyright (c) 2026 BowenLab.
+[MIT License](LICENSE). Copyright (c) 2026 BowenLab.

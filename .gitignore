@@ -16,6 +16,7 @@ coverage.xml
 
 # Local benchmark output can contain machine-specific paths and transient runs.
 benchmarks/results/
+benchmarks/runtime/results/
 
 # Model caches and weights must never enter source control.
 .cache/
