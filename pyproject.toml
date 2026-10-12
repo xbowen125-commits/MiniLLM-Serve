@@ -30,6 +30,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [
+    ".",
+    "src"
+]
 markers = [
     "slow: 需要下载真实模型并推理的集成测试（默认跳过）",
 ]
