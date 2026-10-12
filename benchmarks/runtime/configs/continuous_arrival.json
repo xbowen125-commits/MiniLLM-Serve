@@ -1,0 +1,9 @@
+{
+  "scenario": "continuous_arrival",
+  "start_time": 0,
+  "aging_factor": 1,
+  "starvation_threshold": 10,
+  "groups": [
+    {"prefix": "arrival", "count": 30, "arrival_start": 0, "arrival_interval": 0.5, "phases": ["waiting", "prefill", "decode"], "service_seconds": [1, 2, 3, 4]}
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "scenario": "mixed_length",
+  "start_time": 0,
+  "aging_factor": 1,
+  "starvation_threshold": 10,
+  "groups": [
+    {"prefix": "mixed", "count": 12, "arrival_start": 0, "arrival_interval": 1, "phases": ["waiting", "prefill", "decode"], "service_seconds": [1, 20, 2, 15, 3, 10, 4, 8, 5, 6, 2, 12]}
+  ]
+}

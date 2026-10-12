@@ -4,6 +4,8 @@ from minillm.batching import (
     BatchExecutor,
     BatchStepResult,
     DecodeCoordinator,
+    DecodeStatus,
+    FinishReason,
 )
 from minillm.engine import RequestState, RequestStatus
 
@@ -114,6 +116,8 @@ def test_cancelled_request_is_removed_before_later_steps():
 
     assert cancelled.status is RequestStatus.CANCELLED
     assert cancelled.finished_time == 5.0
+    assert coordinator.get_state("cancelled").status is DecodeStatus.CANCELLED
+    assert coordinator.get_state("cancelled").finish_reason is FinishReason.CANCELLED
     assert remaining.status is RequestStatus.FINISHED
     assert worker.calls == [["cancelled", "remaining"], ["remaining"]]
     assert coordinator.cancel_request(batch, "missing") is False

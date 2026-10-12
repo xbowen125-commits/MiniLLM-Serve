@@ -1,0 +1,10 @@
+{
+  "scenario": "decode_flood",
+  "start_time": 0,
+  "aging_factor": 1,
+  "starvation_threshold": 10,
+  "groups": [
+    {"prefix": "decode", "count": 20, "arrival_start": 0, "arrival_interval": 2, "phases": ["decode"], "service_seconds": [20]},
+    {"prefix": "waiting", "count": 4, "arrival_start": 5, "arrival_interval": 1, "phases": ["waiting"], "service_seconds": [1]}
+  ]
+}
