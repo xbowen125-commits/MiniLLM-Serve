@@ -16,6 +16,7 @@ class ContinuousBatchStepResult:
     error: Exception | str | None = None
     token_id: int | None = None
     finish_reason: FinishReason | None = None
+    prompt_tokens: int = 0
 
     def __post_init__(self):
         if not self.request_id:

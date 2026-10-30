@@ -1,21 +1,32 @@
 # MiniLLM-Serve Architecture
 
-This document describes the current implementation, not a production serving
-roadmap. MiniLLM-Serve combines an online inference service with separate offline
-runtime experiments. See the [project overview](../README.md) for setup and
-[historical evidence](../benchmarks/reports/benchmark-summary.md) for validation
-provenance. Experimental scheduling and simulated memory are not part of the
-HTTP inference path and do not establish parity with vLLM.
+This document describes an experimental implementation, not a production vLLM
+replacement. Legacy HTTP is the default; Continuous HTTP JSON/SSE is explicitly
+enabled. Fake Worker and simulated paged-memory experiments remain separate.
+See the [project overview](../README.md) for setup and
+[current research status](research/CURRENT_STATUS.md) for unclosed findings.
+The draft evidence contract is INTERNALLY_INCONSISTENT; formal online GPU
+Benchmark is not admitted. Historical correctness is not a current performance
+certificate or a full Runtime proof.
 
 ## 1. Overall Architecture
 
 ```mermaid
 flowchart TB
-    subgraph Online[Online serving]
+    subgraph Online[Legacy HTTP - default]
         API[API Layer: FastAPI and SSE] --> Admission[RequestScheduler: FIFO leases]
         Admission --> Engine[GenerationEngine and GenerationRunner]
         Engine --> Model[ModelWorker: Transformers forward]
         Engine --> Cache[Request-local DynamicCache]
+    end
+    subgraph ContinuousHTTP[Continuous HTTP - explicit opt-in]
+        Admission --> Owner[Single ContinuousHTTPOwner]
+        Owner --> OnlineFacade[RuntimeFacade - continuous mode]
+        OnlineFacade --> Iteration[IterationScheduler]
+        Iteration --> OnlinePlan[ContinuousBatchPlan]
+        OnlinePlan --> OnlineExecutor[ContinuousBatchExecutor]
+        OnlineExecutor --> RealWorker[BatchedTransformersWorker]
+        RealWorker --> Pool[SlotKVPool - actual request cache rows]
     end
     subgraph Offline[Offline runtime]
         Facade[RuntimeFacade] --> Coordinator[DecodeCoordinator]
@@ -35,17 +46,22 @@ flowchart TB
     Contracts -. types .-> Coordinator
 ```
 
-These are alternative orchestration paths. `RuntimeFacade` does not wrap the
-online `GenerationEngine`, and the continuous executor is not an HTTP scheduler.
+These are alternative orchestration paths selected at startup. In Continuous
+HTTP, GenerationEngine still loads the one shared model and builds chat prompts;
+the owner passes that loaded model/tokenizer to the batch Worker and drives
+RuntimeFacade. It does not run a second legacy generation loop per request.
+RequestScheduler retains HTTP admission/deadline/lease duties, while
+IterationScheduler selects iteration members. Offline phase executors remain
+separate; synthetic block IDs do not enter model attention.
 
 | Layer | Responsibility | Current boundary |
 | --- | --- | --- |
 | API Layer | Validate Chat Completions requests; format JSON/SSE; detect disconnects; manage startup/shutdown | `server.py`, `schemas.py`; no direct model forward |
-| Runtime Core | Own request contexts, apply phase results, track progress/errors and expose offline snapshots/results | `runtime/`, `batching/`; manually driven offline |
-| Scheduler | Online bounded FIFO admission and leases; offline phase policies and continuous batch selection | `scheduler/`, `request_queue.py`, `continuous/scheduler.py`; separate roles |
+| Runtime Core | Own contexts, apply results, acknowledge consumed outcomes and coordinate cleanup | `runtime/`, `batching/`; offline caller or one HTTP owner |
+| Scheduler | FIFO HTTP admission/leases; separate offline policies and iteration selection | `scheduler/`, `continuous/iteration_scheduler.py`; no second HTTP admission ledger |
 | Execution | Validate phases and result completeness; delegate prefill/decode calls; collect execution counters | `execution/`; backend-independent |
-| Worker | Load/tokenize/forward/sample according to its protocol; retain and release backend cache references | Online `engine/worker.py`; experimental `workers/` |
-| Memory | Account for synthetic capacity and maintain ordered request-local block mappings | `memory/`; no GPU tensor allocation |
+| Worker | Execute forward/sample, retain and release request cache references | Legacy `engine/worker.py`; opt-in `workers/batched_transformers_worker.py` |
+| Memory | Real SlotKVPool references plus separate simulated capacity/block ledgers | `memory/slot_kv_pool.py` owns real cache references; paged accounting is not a GPU allocator |
 
 `contracts/` defines shared phases, result types and runtime status enums without
 depending on execution or batching. This avoids reverse dependencies for shared
@@ -53,7 +69,7 @@ types; higher-level orchestrators still compose the modules explicitly.
 
 ### Online execution and resource safety
 
-Non-streaming inference runs through `asyncio.to_thread`. SSE uses a dedicated
+In legacy mode, non-streaming inference runs through `asyncio.to_thread`. SSE uses a dedicated
 producer thread and a bounded thread-safe queue. Both acquire the same online
 scheduler lease. Queue timeout and execution timeout have different meanings:
 the former limits admission waiting, the latter begins after admission.
@@ -61,7 +77,17 @@ the former limits admission waiting, the latter begins after admission.
 Cancellation is cooperative between generation steps. A timeout or disconnect
 does not stop an active CUDA kernel immediately. The online execution slot is
 released only after the underlying worker exits, avoiding excess concurrency.
-The experimental runtime described below does not replace this mechanism.
+In Continuous mode, a single owner serializes submit/step/cancel/acknowledge
+and resource operations. Scheduler and Runtime share RequestState; the handler
+does not operate the Worker or Slot pool. Token events use bounded per-request
+channels, and overflow cancels the affected request rather than silently losing
+text. Leases wait for safe completion, cleanup and required consumer confirmation.
+
+Use `python -m minillm.continuous_server` with explicit Continuous settings for
+the early shutdown hook. Generic Uvicorn waits for handlers before lifespan
+shutdown. The shipped Docker/Compose command remains legacy, not an independently
+validated Continuous-container launcher. No built-in authentication or TLS is
+provided; local examples bind loopback.
 
 ## 2. Request Lifecycle
 
@@ -114,7 +140,7 @@ client metrics have different timing boundaries.
 ## 3. Continuous Batching Flow
 
 `ContinuousBatch` retains waiting, active and finished context groups.
-`continuous.BatchExecutor` drives the existing offline coordinator or consumes
+`continuous.BatchExecutor` drives the existing coordinator or consumes
 the batch-worker protocol directly. One cycle follows this order:
 
 ```mermaid
@@ -143,23 +169,36 @@ There are two compatible worker routes:
 - `ContinuousBatchWorkerProtocol`: `prefill_batch`/`decode_batch` results are
   validated for complete, unique IDs and correct phases before application.
 
-Logical grouping does not guarantee tensor batching. The experimental
-`TransformersBatchWorker` supports CPU batches of at most two contexts, using
-basic K/V concatenation and cloned cache rows. Its fake-model tests are
-correctness scaffolding, not evidence of optimized real GPU batching.
+Logical grouping alone does not guarantee tensor batching. The CPU scaffolding
+is `TransformersBatchWorker`; its `BatchedTransformersWorker` subclass supplies
+CPU/CUDA tensor execution and SlotKVPool for the opt-in HTTP path. Batch size is
+at most two, with limited full-attention cache layouts, K/V padding/concatenation
+and cloned row splitting. Historical real-model tests are correctness evidence
+for their recorded settings, not optimized production performance proof.
 
 ### Cleanup ownership
 
-The continuous executor owns context grouping and cancels remaining requests
-when closed; its caller owns the worker. Closing the executor does **not** close
-the worker. Explicitly release worker sessions or close the paged wrapper after
-executor shutdown. Finished contexts can remain in the finished group for
-inspection; that is distinct from keeping backend cache resources alive.
+The executor owns context grouping and request cleanup; Worker lifetime belongs
+to its caller. RuntimeFacade distinguishes owned and borrowed Workers; the HTTP
+owner creates an owned Worker. Closing a bare executor does not authorize closing
+a shared Worker. Offline paged-wrapper callers must close their owned wrapper
+after executor shutdown. HTTP acknowledgement/forgetting follows consumption
+and confirmed cleanup, so histories need not grow forever.
+
+Request terminal state, release attempt, actual Slot absence, original
+`kv_cache_ref` clearing, pending retirement records, consumer completion and Lease
+release are separate observations. Cleanup failures retain retry information;
+they cannot be converted into successful drain by emptying dictionaries. New
+admission cannot reuse an occupied or unconfirmed Slot. Cancellation takes effect
+at a synchronous safe boundary, and permanent failure may prevent termination.
+Current evidence-contract ordering/model gaps remain open; none is repaired by
+this documentation update.
 
 ## 4. KV Memory Architecture
 
-The real online `DynamicCache` and the simulated memory ledger are separate.
-Only the former contains model K/V tensors.
+Real legacy DynamicCache and Continuous SlotKVPool cache rows contain model K/V
+tensors. The simulated paged-memory ledger is separate and does not address
+those tensors or implement PagedAttention.
 
 ```mermaid
 flowchart TD
@@ -220,7 +259,8 @@ Virtual costs are experimental inputs, not measured model latencies. Fair Aging
 is not always better, and a finite workload does not prove starvation freedom.
 The simulated memory ledger does not establish actual GPU memory savings.
 
-Future integration would require backend compatibility checks, real tensor/cache
-layout work, stronger correctness evidence and explicit cleanup guarantees.
-This document does not claim production GPU continuous batching, PagedAttention,
-multi-GPU serving or changes to the existing API/Docker path.
+Future work includes contract amendments, stronger independently reviewable
+tensor/cache evidence, backend compatibility, soak/signal tests and proof-scope
+closure. It is not a list of completed features. This document claims no
+production GPU performance, PagedAttention or multi-GPU serving. The existing
+API formats and default legacy Docker deployment remain unchanged.

@@ -120,6 +120,30 @@ async def _finalize_nonstream_worker(
     await lease.release(outcome)
 
 
+async def _continuous_admission(scheduler, config, request):
+    """Observe disconnects while queued, before ownership passes to runtime."""
+    admission = asyncio.create_task(scheduler.acquire(config))
+    try:
+        while not admission.done():
+            if await request.is_disconnected():
+                raise asyncio.CancelledError
+            await asyncio.sleep(0.01)
+        return admission.result()
+    except asyncio.CancelledError:
+        if admission.done() and not admission.cancelled():
+            try:
+                lease = admission.result()
+            except Exception:
+                pass
+            else:
+                # No owner handoff yet; there can be no GPU resources.
+                await asyncio.shield(lease.release("cancelled"))
+        else:
+            admission.cancel()
+            await asyncio.gather(admission, return_exceptions=True)
+        raise
+
+
 class _StreamSession:
     """Own a streaming worker independently from the cancellable HTTP body task."""
 
@@ -219,6 +243,168 @@ class _StreamSession:
             self.cleanup_done.set()
 
 
+class _ContinuousStreamSession:
+    """Transport consumer, not a producer or a second generation lifecycle."""
+
+    def __init__(self, req, handle, lease):
+        self.req, self.handle, self.lease = req, handle, lease
+        self.consumer_done = asyncio.Event()
+        self.cancelled = False
+        self.body_complete = False
+
+    def cancel(self):
+        self.cancelled = True
+        self.handle.cancel()
+
+    async def finalize(self):
+        # Hold admission through consumption, bounding completed-but-slow HTTP
+        # tails as well as running generations. Never wait for this finalizer
+        # inside the SSE body: that would deadlock consumer_done.
+        delivery = asyncio.wrap_future(self.handle.completion)
+        while True:
+            try:
+                completion = await asyncio.shield(delivery)
+                break
+            except asyncio.CancelledError:
+                self.cancel()
+                asyncio.current_task().uncancel()
+        while not self.consumer_done.is_set():
+            try:
+                await self.consumer_done.wait()
+            except asyncio.CancelledError:
+                self.cancel()
+                asyncio.current_task().uncancel()
+        outcome = ("failed" if self.handle.failure else
+                   "cancelled" if self.handle.cancel_event.is_set() and completion.outcome == "completed" else completion.outcome)
+        while True:
+            try:
+                await self.lease.release(outcome)
+                return
+            except asyncio.CancelledError:
+                asyncio.current_task().uncancel()
+
+
+class _ContinuousCleanupTask(asyncio.Task):
+    """Translate cancellation into request intent, even before first execution.
+
+    Once created this resource-owning task must settle the real completion and
+    consumer. Returning False means the task itself was not cancelled. Forced
+    process termination still cannot provide a cleanup guarantee.
+    """
+
+    def __init__(self, session, *, name):
+        self.session = session
+        super().__init__(session.finalize(), name=name)
+
+    def cancel(self, msg=None):
+        if self.done():
+            return False
+        self.session.cancel()
+        return False
+
+
+class _ContinuousStreamingResponse(StreamingResponse):
+    """Bound each ASGI send; a stalled socket cannot retain admission forever."""
+
+    def __init__(self, session, *, send_timeout, on_consumer_done=None, **kwargs):
+        self.session = session
+        self.send_timeout = send_timeout
+        self.on_consumer_done = on_consumer_done
+        super().__init__(_continuous_chat_events(session), **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        async def bounded_send(message):
+            try:
+                await asyncio.wait_for(send(message), self.send_timeout)
+            except TimeoutError:
+                self.session.handle.fail("stream_send_timeout", "SSE transport send timed out")
+                self.session.cancel()
+                raise
+        try:
+            await super().__call__(scope, receive, bounded_send)
+        finally:
+            # Includes failure sending headers, disconnect while send is paused,
+            # and a generator which has not started. Idempotent, no GPU cleanup.
+            if not self.session.body_complete:
+                self.session.cancel()
+            try:
+                await self.body_iterator.aclose()
+            finally:
+                self.session.consumer_done.set()
+                if self.on_consumer_done is not None:
+                    self.on_consumer_done()
+
+
+async def _continuous_chat_events(session):
+    from .runtime.streaming import IncrementalTextAdapter
+    handle, req = session.handle, session.req
+    response_id, created = make_response_id(), int(time.time())
+    decoded_prefix = ""
+    adapter = IncrementalTextAdapter(lambda _ids: decoded_prefix, stop=req.stop)
+    ordinal = 0
+    normal_end = False
+    error = None
+    try:
+        yield _sse_data(_chunk_payload(make_chunk(response_id, created, req.model, role="assistant")))
+        while True:
+            try:
+                event = handle.events.get_nowait()
+            except queue.Empty:
+                if handle.completion.done():
+                    break
+                await asyncio.sleep(.002)
+                continue
+            if error is not None:
+                continue
+            try:
+                if event.ordinal != ordinal + 1:
+                    raise RuntimeError("out-of-order continuous token event")
+                ordinal = event.ordinal
+                decoded_prefix = event.decoded_text
+                delta = adapter.push(event.token_id)
+            except Exception as exc:
+                error = ("stream_decode_error", str(exc))
+                handle.fail(*error)
+                continue
+            if delta:
+                yield _sse_data(_chunk_payload(make_chunk(response_id, created, req.model, content=delta)))
+        try:
+            completion = handle.completion.result()
+        except Exception as exc:
+            error = ("cleanup_unconfirmed", str(exc))
+        else:
+            error = handle.failure or error
+            if error is None and handle.cancel_event.is_set() and completion.outcome == "completed":
+                error = ("request_cancelled", "Request cancelled")
+            if error is None and completion.outcome != "completed":
+                error = (("inference_timeout", "推理执行超时") if completion.outcome == "inference_timeout" else
+                         ("request_cancelled", "Request cancelled") if completion.outcome == "cancelled" else
+                         ("generation_failed", completion.error or "Generation failed"))
+            if error is None:
+                try:
+                    delta = adapter.finish()
+                    if adapter.text != completion.result.text:
+                        raise RuntimeError("stream text differs from confirmed generation result")
+                except Exception as exc:
+                    error = ("stream_decode_error", str(exc))
+                    handle.fail(*error)
+                else:
+                    if delta:
+                        yield _sse_data(_chunk_payload(make_chunk(response_id, created, req.model, content=delta)))
+                    yield _sse_data(_chunk_payload(make_chunk(response_id, created, req.model,
+                        finish_reason=completion.result.finish_reason)))
+        if error is not None:
+            yield _sse_data(APIErrorResponse(error=APIError(message=error[1],
+                type="timeout_error" if error[0] == "inference_timeout" else "internal_error",
+                code=error[0])).model_dump())
+        yield _sse_data("[DONE]")
+        normal_end = True
+    finally:
+        if not normal_end:
+            session.cancel()
+        session.body_complete = normal_end
+
+
 async def _stream_chat_events(session: _StreamSession):
     """Deliver SSE; worker/lease cleanup is owned by the independent finalizer."""
     req = session.req
@@ -285,7 +471,7 @@ async def _stream_chat_events(session: _StreamSession):
     yield _sse_data("[DONE]")
 
 
-def create_app(settings: Optional[Settings] = None) -> FastAPI:
+def create_app(settings: Optional[Settings] = None, *, continuous_owner_factory=None) -> FastAPI:
     settings = settings or Settings()
     engine = GenerationEngine(settings)
     scheduler = RequestScheduler(
@@ -293,7 +479,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         queue_capacity=settings.request_queue_capacity,
         queue_timeout_seconds=settings.queue_timeout_seconds,
         inference_timeout_seconds=settings.inference_timeout_seconds,
+        external_lifecycle=settings.execution_mode == "continuous",
     )
+    owner = None
+    if settings.execution_mode == "continuous":
+        from .runtime.http_owner import ContinuousHTTPOwner
+        owner = (continuous_owner_factory or ContinuousHTTPOwner)(engine, settings)
     cleanup_tasks: set[asyncio.Task[None]] = set()
 
     def track_cleanup(task: asyncio.Task[None]) -> asyncio.Task[None]:
@@ -318,15 +509,33 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("loading model %s ...", settings.model_name)
-        engine.load()
+        if owner is None:
+            engine.load()
+        else:
+            await asyncio.wrap_future(owner.start())
         logger.info("model ready (device=%s)", engine.device)
         try:
             yield
         finally:
             logger.info("stopping request scheduler")
-            await scheduler.close()
+            if owner is None:
+                await scheduler.close()
+            else:
+                drain = asyncio.create_task(scheduler.close())
+                stopped = asyncio.wrap_future(owner.stopped)
+                done, _ = await asyncio.wait((drain, stopped), return_when=asyncio.FIRST_COMPLETED)
+                if stopped in done:
+                    drain.cancel()
+                    await asyncio.gather(drain, return_exceptions=True)
+                    # A dead owner cannot run further finalizers. Propagate its
+                    # failure; retained leases explicitly remain non-idle.
+                    await stopped
+                await drain
             if cleanup_tasks:
                 await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            if owner is not None:
+                await asyncio.wrap_future(owner.close())
+                await asyncio.to_thread(owner.thread.join)
 
     app = FastAPI(
         title="MiniLLM-Serve",
@@ -338,6 +547,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.engine = engine
     app.state.request_scheduler = scheduler
     app.state.cleanup_tasks = cleanup_tasks
+    app.state.continuous_owner = owner
+    app.state.begin_shutdown = scheduler.begin_shutdown
+    stream_sessions = set()
+    app.state.stream_sessions = stream_sessions
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -348,7 +561,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         current_settings: Settings = request.app.state.settings
         current_engine: GenerationEngine = request.app.state.engine
         return {
-            "status": "ok",
+            "status": "ok" if owner is None or owner.status()["ready"] else "unavailable",
             "model": current_settings.model_name,
             "loaded": current_engine.is_loaded,
             "device": str(getattr(current_engine, "device", "unknown")),
@@ -366,6 +579,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         current: RequestScheduler = request.app.state.request_scheduler
         snapshot = await current.snapshot()
         snapshot["gpu"] = _gpu_status(request.app.state.engine)
+        if owner is not None:
+            snapshot["continuous"] = owner.status()
+            snapshot["continuous"]["stream_consumers"] = len(stream_sessions)
+            snapshot["continuous"]["pending_finalizers"] = len(cleanup_tasks)
+            snapshot["continuous"]["owner_thread_alive"] = owner.thread.is_alive()
         return snapshot
 
     @app.post("/v1/chat/completions")
@@ -386,14 +604,90 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "model_not_found",
             )
 
+        if owner is not None:
+            if not owner.status()["ready"]:
+                return _error_response(503, "Continuous runtime unavailable", "not_ready")
+
         try:
-            lease = await current_scheduler.acquire(_generation_config(req))
+            if owner is None:
+                lease = await current_scheduler.acquire(_generation_config(req))
+            else:
+                lease = await _continuous_admission(current_scheduler, _generation_config(req), request)
         except SchedulerQueueFull as exc:
             return _error_response(429, str(exc), "rate_limit_error", "queue_full")
         except SchedulerQueueTimeout as exc:
             return _error_response(503, str(exc), "timeout_error", "queue_timeout")
         except SchedulerClosed as exc:
             return _error_response(503, str(exc), "service_unavailable", "scheduler_closed")
+
+        if owner is not None:
+            if req.stream:
+                try:
+                    handle = owner.submit_stream(lease.request_state, req.messages, lease.cancel_event,
+                        deadline=lease.admitted_at + settings.inference_timeout_seconds)
+                except Exception as exc:
+                    await lease.release("failed")
+                    return _error_response(503, str(exc), "service_unavailable", "owner_unavailable")
+                session = _ContinuousStreamSession(req, handle, lease)
+                stream_sessions.add(session)
+                finalizer = track_cleanup(_ContinuousCleanupTask(session,
+                    name=f"minillm-continuous-stream-finalizer-{lease.request_id}"))
+                def forget_session(_done=None):
+                    if session.consumer_done.is_set() and finalizer.done():
+                        stream_sessions.discard(session)
+                finalizer.add_done_callback(forget_session)
+                headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **_lease_headers(lease)}
+                return _ContinuousStreamingResponse(session,
+                    send_timeout=settings.continuous_send_timeout_seconds,
+                    on_consumer_done=forget_session,
+                    media_type="text/event-stream", headers=headers)
+            try:
+                delivery = asyncio.wrap_future(owner.submit(lease.request_state, req.messages, lease.cancel_event,
+                    deadline=lease.admitted_at + settings.inference_timeout_seconds))
+            except Exception as exc:
+                await lease.release("failed")
+                return _error_response(503, str(exc), "service_unavailable", "owner_unavailable")
+
+            async def finalize_continuous():
+                # Exists independently of the HTTP task. Cancellation of the
+                # latter cannot cancel the Future or the actual cleanup.
+                while True:
+                    try:
+                        completion = await asyncio.shield(delivery)
+                        break
+                    except asyncio.CancelledError:
+                        lease.cancel_event.set()
+                        asyncio.current_task().uncancel()
+                while True:
+                    try:
+                        await lease.release(completion.outcome)
+                        return completion
+                    except asyncio.CancelledError:
+                        asyncio.current_task().uncancel()
+
+            cleanup = track_cleanup(asyncio.create_task(finalize_continuous(),
+                name=f"minillm-continuous-finalizer-{lease.request_id}"))
+            try:
+                while not cleanup.done():
+                    if await request.is_disconnected():
+                        lease.cancel_event.set()
+                    await asyncio.sleep(0.01)
+                completion = await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                lease.cancel_event.set()
+                raise
+            except Exception as exc:
+                return _error_response(503, str(exc), "service_unavailable", "cleanup_unconfirmed")
+            if completion.outcome == "inference_timeout":
+                return _error_response(504, "推理执行超时", "timeout_error", "inference_timeout")
+            if completion.outcome == "cancelled":
+                return _error_response(503, "Request cancelled", "cancelled", "request_cancelled")
+            if completion.outcome == "failed":
+                return _error_response(500, f"生成失败: {completion.error}", "internal_error")
+            result = completion.result
+            response.headers.update(_lease_headers(lease))
+            return make_response(req.model, result.text, result.finish_reason,
+                                 result.prompt_tokens, result.completion_tokens)
 
         if req.stream:
             session = _StreamSession(req, eng, lease)

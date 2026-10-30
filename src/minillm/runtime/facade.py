@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..contracts import ExecutionPhase, FinishReason
 from ..engine.config import GenerationConfig
@@ -20,6 +20,8 @@ class RuntimeResultMetrics:
     decode_steps: int
     prefill_tokens: int
     decode_tokens: int
+    arrival_ttft_ms: float | None = None
+    tpot_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,30 +44,70 @@ class RuntimeFacade:
     Calls are serialized; close waits for any synchronous worker call to return.
     """
 
-    def __init__(self, worker: ExecutionWorkerProtocol, *, max_batch_size: int = 4) -> None:
+    def __init__(self, worker: ExecutionWorkerProtocol, *, max_batch_size: int = 4,
+                 execution_mode: str = "legacy", scheduler=None, owns_worker: bool = False) -> None:
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be at least 1")
         # Local imports avoid making runtime package initialization depend on
         # batching, whose compatibility adapter imports runtime.context.
         from ..batching import BatchExecutor, DecodeCoordinator
         from ..execution.executor import ExecutionManager
-        self._manager = ExecutionManager(worker)
-        self._coordinator = DecodeCoordinator(BatchExecutor(), execution_manager=self._manager)
+        if execution_mode not in {"legacy", "continuous"}:
+            raise ValueError("unknown execution mode")
+        self._continuous = None
+        self._binding = None
+        self._owner = object()
+        self._worker = worker
+        self._owns_worker = owns_worker
+        if execution_mode == "continuous":
+            from ..continuous.executor import BatchExecutor as ContinuousExecutor
+            from ..continuous.iteration_scheduler import IterationScheduler
+            from ..continuous.worker import ManagedBatchWorkerProtocol
+            from .resources import bind_worker
+            if not isinstance(worker, ManagedBatchWorkerProtocol):
+                raise TypeError("continuous mode requires batch methods and release_request")
+            limit = getattr(worker, "max_batch_size", None)
+            capacity = getattr(getattr(worker, "pool", None), "capacity", None)
+            if limit is None or capacity is None or max_batch_size > min(limit, capacity):
+                raise ValueError("Worker batch/slot capacity mismatch")
+            scheduler = scheduler or IterationScheduler(max_batch_size=max_batch_size)
+            if not isinstance(scheduler, IterationScheduler) or scheduler.max_active != max_batch_size:
+                raise ValueError("iteration scheduler capacity mismatch")
+            if owns_worker and not callable(getattr(worker, "close", None)):
+                raise TypeError("owned Worker requires close")
+            self._continuous = ContinuousExecutor(worker, scheduler=scheduler)
+            self._manager = None
+            self._coordinator = self._continuous.coordinator
+            self._binding = bind_worker(worker)
+            self._binding.attach(self._owner, owns_worker)
+        else:
+            if scheduler is not None or owns_worker:
+                raise ValueError("scheduler/ownership options require continuous mode")
+            self._manager = ExecutionManager(worker)
+            self._coordinator = DecodeCoordinator(BatchExecutor(), execution_manager=self._manager)
         self.max_batch_size = max_batch_size
         self._closed = False
         self._executing = False
-        self._lock = threading.RLock()
+        self._lock = self._binding.lock if self._binding else threading.RLock()
         self._archive: dict[str, RuntimeResult] = {}
 
     def submit(self, prompt: str, generation_config: GenerationConfig | None = None,
-               *, request_id: str | None = None) -> RuntimeRequestContext:
+               *, request_id: str | None = None,
+               request_state: RequestState | None = None) -> RuntimeRequestContext:
         """Create and register the only context for a request ID."""
         with self._lock:
             self._require_open()
-            config = generation_config or GenerationConfig()
+            config = generation_config or (request_state.generation_config if request_state is not None else GenerationConfig())
             if config.max_tokens < 1:
                 raise ValueError("max_tokens must be at least 1")
-            request = RequestState(prompt=prompt, generation_config=config)
+            request = request_state or RequestState(prompt=prompt, generation_config=config)
+            if request_state is not None:
+                if request.status is not RequestStatus.WAITING:
+                    raise ValueError("handoff requires a WAITING RequestState")
+                if request_id is not None and request_id != request.request_id:
+                    raise ValueError("handoff request_id mismatch")
+                request.prompt = prompt
+                request.generation_config = config
             if request_id is not None:
                 if not request_id:
                     raise ValueError("request_id must not be empty")
@@ -73,7 +115,13 @@ class RuntimeFacade:
             if request.request_id in self._coordinator.contexts:
                 raise ValueError("duplicate request_id")
             context = RuntimeRequestContext(request)
-            self._coordinator.contexts[request.request_id] = context
+            if self._continuous is not None:
+                if request.request_id in self._binding.claims:
+                    raise ValueError("request_id already claimed on shared Worker")
+                self._continuous.add(context)
+                self._binding.claims[request.request_id] = self._owner
+            else:
+                self._coordinator.contexts[request.request_id] = context
             return context
 
     def step(self) -> tuple[str, ...]:
@@ -84,6 +132,17 @@ class RuntimeFacade:
             self._require_open()
             if self._executing:
                 raise RuntimeError("runtime step cannot be reentered")
+            if self._continuous is not None:
+                self._executing = True
+                try:
+                    self._continuous.release_terminal(strict=False)
+                    plan = self._continuous.scheduler.build_plan(self._continuous.batch)
+                    free = self._worker.pool.capacity - self._worker.pool.snapshot()["allocated_slots"]
+                    plan = replace(plan, prefill_requests=plan.prefill_requests[:max(0, free)])
+                    result = self._continuous.execute_plan(plan)
+                    return result.decoded + result.prefilled
+                finally:
+                    self._executing = False
             requests = [c.request for c in self._coordinator.contexts.values() if not c.request.is_terminal]
             if not requests:
                 return ()
@@ -107,10 +166,14 @@ class RuntimeFacade:
             self._require_open()
             context = self._coordinator.contexts[request_id]
             if context.request.is_terminal:
+                if self._continuous is not None:
+                    self._continuous.release_terminal(request_id)
                 return False
             if self._executing:
                 raise RuntimeError("cancel must occur between runtime steps")
             DecodeStateAdapter(context).cancel()
+            if self._continuous is not None:
+                self._continuous.release_terminal(request_id)
             return True
 
     def get_result(self, request_id: str) -> RuntimeResult:
@@ -126,7 +189,11 @@ class RuntimeFacade:
                 view.finish_reason, view.error,
                 RuntimeResultMetrics(context.metrics.first_token_latency_ms,
                                      context.metrics.total_latency_ms, decode.decode_steps,
-                                     decode.prefill_tokens, decode.decode_tokens),
+                                     decode.prefill_tokens, decode.decode_tokens,
+                                     None if decode.first_token_time is None else
+                                     (decode.first_token_time - context.request.created_time) * 1000,
+                                     None if decode.decode_tokens < 2 or decode.first_token_time is None or decode.last_token_time is None else
+                                     (decode.last_token_time - decode.first_token_time) * 1000 / (decode.decode_tokens - 1)),
             )
 
     def snapshot(self):
@@ -144,6 +211,39 @@ class RuntimeFacade:
                 sum(r.metrics.decode_steps for r in results), time.time(),
             )
 
+    def acknowledge(self, request_id: str) -> None:
+        """Forget a consumed terminal result only after backend cleanup succeeds.
+
+        The caller must first copy its result. Failure retains all ownership and
+        can be retried; no execution or active result can be forgotten.
+        """
+        with self._lock:
+            self._require_open()
+            context = self._coordinator.contexts.get(request_id)
+            if context is None:
+                return
+            if not context.request.is_terminal:
+                raise RuntimeError("cannot acknowledge an active request")
+            if self._continuous is not None:
+                self._continuous.release_terminal(request_id)
+                if request_id not in self._continuous._released:
+                    raise RuntimeError("request cleanup not confirmed")
+                self._continuous.batch.finished_requests.pop(request_id, None)
+                self._continuous._released.discard(request_id)
+                self._continuous.scheduler._observed_finished.discard(request_id)
+                self._binding.claims.pop(request_id, None)
+            self._coordinator.contexts.pop(request_id)
+
+    def retention(self) -> dict[str, int]:
+        """Prompt-free retained references, for bounded-history verification."""
+        with self._lock:
+            return {
+                "contexts": len(self._coordinator.contexts),
+                "claims": sum(v is self._owner for v in self._binding.claims.values()) if self._binding else 0,
+                "released_ids": len(self._continuous._released) if self._continuous else 0,
+                "finished_ids": len(self._continuous.scheduler._observed_finished) if self._continuous else 0,
+            }
+
     def close(self) -> None:
         """Cancel unfinished requests, drop contexts, and preserve results."""
         with self._lock:
@@ -151,12 +251,21 @@ class RuntimeFacade:
                 return
             if self._executing:
                 raise RuntimeError("close must occur between runtime steps")
+            if self._continuous is not None:
+                self._continuous.close()
+                if self._owns_worker:
+                    self._worker.close()
             for request_id, context in tuple(self._coordinator.contexts.items()):
                 if not context.request.is_terminal:
                     self.cancel(request_id)
                 context.request.kv_cache_ref = None
                 self._archive[request_id] = self.get_result(request_id)
+                if self._binding is not None:
+                    self._binding.claims.pop(request_id, None)
             self._coordinator.contexts.clear()
+            if self._continuous is not None:
+                self._continuous.batch.finished_requests.clear()
+                self._binding.clients.pop(self._owner, None)
             self._closed = True
 
     def _require_open(self) -> None:

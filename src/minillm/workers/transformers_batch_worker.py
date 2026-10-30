@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from typing import Any, Callable
+import logging
 
 import torch
 
@@ -24,6 +25,18 @@ class _BatchSession:
     emitted: int = 0
 
 
+@dataclass
+class _Retirement:
+    """Cleanup ownership only; never resumes generation or owns lifecycle."""
+
+    request: Any
+    attempts: int = 0
+    slot_released: bool | None = None
+    reference_cleared: bool = False
+    last_error: str | None = None
+    observation_error: str | None = None
+
+
 class TransformersBatchWorker:
     """CPU-only, at most two contexts per call; no scheduling integration.
 
@@ -42,6 +55,7 @@ class TransformersBatchWorker:
         self.cache_factory = cache_factory or KVCacheManager().create
         self.kv = BatchKVAdapter()
         self._sessions = {}
+        self._retiring = {}
 
     @staticmethod
     def _validate_batch(requests):
@@ -90,15 +104,63 @@ class TransformersBatchWorker:
             return self.loaded.model.forward(input_ids=ids, attention_mask=mask,
                 position_ids=positions[:, -ids.shape[1]:], past_key_values=cache, use_cache=True)
 
+    def _cache_absent(self, request_id):
+        """Query the owning adapter, not session membership or global counts."""
+        try:
+            self.kv.get_batch_kv([request_id])
+        except KeyError:
+            return True
+        return False
+
+    @staticmethod
+    def _clear_request_cache(request):
+        if request is not None:
+            request.kv_cache_ref = None
+            if request.kv_cache_ref is not None:
+                raise RuntimeError("request cache reference not cleared")
+
     def release_request(self, request_id):
-        session = self._sessions.pop(request_id, None)
-        if session is not None:
-            self.kv.release_request(request_id)
-            session.context.request.kv_cache_ref = None
+        retirement = self._retiring.get(request_id)
+        if retirement is None:
+            session = self._sessions.get(request_id)
+            retirement = _Retirement(session.context.request if session is not None else None)
+            # Preserve original identity BEFORE dropping execution state.
+            self._retiring[request_id] = retirement
+            self._sessions.pop(request_id, None)
+        retirement.attempts += 1
+        try:
+            absent = self._cache_absent(request_id)
+            if retirement.request is None and not absent:
+                raise RuntimeError("allocated cache has no original request identity; cleanup UNKNOWN")
+            if not absent:
+                self.kv.release_request(request_id)
+            if not self._cache_absent(request_id):
+                raise RuntimeError("request cache still allocated after release")
+            retirement.slot_released = True
+            self._clear_request_cache(retirement.request)
+            retirement.reference_cleared = retirement.request is None or retirement.request.kv_cache_ref is None
+            if not retirement.reference_cleared:
+                raise RuntimeError("request cache reference not cleared")
+        except Exception as error:
+            retirement.last_error = str(error)
+            try:
+                retirement.slot_released = self._cache_absent(request_id)
+            except Exception as observation_error:
+                retirement.slot_released = None  # UNKNOWN, preserve original exception
+                retirement.observation_error = str(observation_error)
+            raise
+        self._retiring.pop(request_id)
 
     def close(self):
-        for request_id in tuple(self._sessions):
+        for request_id in tuple(dict.fromkeys((*self._sessions, *self._retiring))):
             self.release_request(request_id)
+
+    def _release_after_error(self, request_id, original):
+        try:
+            self.release_request(request_id)
+        except Exception as cleanup:
+            original.cleanup_errors = getattr(original, "cleanup_errors", []) + [cleanup]
+            logging.getLogger(__name__).exception("cleanup failed after execution error: %s", request_id)
 
     def _prune(self):
         for request_id, session in tuple(self._sessions.items()):
@@ -115,7 +177,7 @@ class TransformersBatchWorker:
         errors, good = {}, []
         for context in contexts:
             try:
-                if context.request_id in self._sessions:
+                if context.request_id in self._sessions or context.request_id in self._retiring:
                     raise ValueError("request already prefilled")
                 self.builder.build_prefill([context])
                 good.append(context)
@@ -131,14 +193,16 @@ class TransformersBatchWorker:
                     if context.request.generation_config.seed is not None:
                         generator = torch.Generator(device="cpu")
                         generator.manual_seed(context.request.generation_config.seed)
-                    self.kv.add_request_cache(context.request_id, cache)
                     self._sessions[context.request_id] = _BatchSession(
                         context, inputs.attention_mask[row:row + 1].clone(),
                         output.logits[row:row + 1, -1, :].clone(), generator)
+                    # Install cleanup identity before an adapter may allocate
+                    # and then raise. No model/sampling operation changes.
+                    self.kv.add_request_cache(context.request_id, cache)
                     context.request.kv_cache_ref = cache
             except Exception as error:
                 for context in good:
-                    self.release_request(context.request_id)
+                    self._release_after_error(context.request_id, error)
                     errors[context.request_id] = self._error(context, ExecutionPhase.PREFILL, error)
         return [errors.get(c.request_id) or ContinuousBatchStepResult(c.request_id, ExecutionPhase.PREFILL)
                 for c in contexts]
@@ -160,7 +224,7 @@ class TransformersBatchWorker:
             except Exception as error:
                 session = self._sessions.get(context.request_id)
                 if session is not None and session.context is context:
-                    self.release_request(context.request_id)
+                    self._release_after_error(context.request_id, error)
                 results[context.request_id] = self._error(context, ExecutionPhase.DECODE, error)
         if ready:
             try:
@@ -180,7 +244,7 @@ class TransformersBatchWorker:
                     session.logits = output.logits[row:row + 1, -1, :].clone()
             except Exception as error:
                 for context in ready:
-                    self.release_request(context.request_id)
+                    self._release_after_error(context.request_id, error)
                     results[context.request_id] = self._error(context, ExecutionPhase.DECODE, error)
         for context in contexts:
             if context.request_id in results:
@@ -205,6 +269,6 @@ class TransformersBatchWorker:
                 if finished:
                     self.release_request(context.request_id)
             except Exception as error:
-                self.release_request(context.request_id)
+                self._release_after_error(context.request_id, error)
                 results[context.request_id] = self._error(context, ExecutionPhase.DECODE, error)
         return [results[c.request_id] for c in contexts]

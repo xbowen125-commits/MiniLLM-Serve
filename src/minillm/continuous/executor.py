@@ -1,6 +1,8 @@
 """Persistent offline step driver using the model-independent worker protocol."""
 
 from dataclasses import dataclass
+import logging
+import time
 
 from ..batching.batch import BatchState
 from ..batching.coordinator import DecodeCoordinator
@@ -15,6 +17,15 @@ from .plan import ContinuousBatchPlan
 from .step import ContinuousBatchStepResult
 from ..contracts import DecodeStepResult, ExecutionPhase, PrefillStepResult, FinishReason
 from .worker import ContinuousBatchWorkerProtocol
+from .worker import ManagedBatchWorkerProtocol
+
+logger = logging.getLogger(__name__)
+
+
+class ResourceCleanupError(RuntimeError):
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__("request resource cleanup failed: " + "; ".join(str(e) for e in errors))
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +51,8 @@ class BatchExecutor:
             LegacyBatchExecutor(), execution_manager=ExecutionManager(worker) if self.batch_worker is None else None,
         )
         self._closed = False
+        self._managed = isinstance(worker, ManagedBatchWorkerProtocol)
+        self._released = set()
 
     def add(self, context: RuntimeRequestContext) -> None:
         self._require_open()
@@ -55,6 +68,8 @@ class BatchExecutor:
 
     def step(self) -> ContinuousStep:
         self._require_open()
+        if self._managed:
+            self.release_terminal(strict=False)
         retired = list(self.batch.retire())
         result = self.execute_plan(self.scheduler.build_plan(self.batch))
         return ContinuousStep(result.decoded, result.prefilled,
@@ -97,7 +112,9 @@ class BatchExecutor:
                 # Whole-step failure leaves WAITING contexts retryable instead
                 # of occupying active slots without a valid prefill result.
                 for context in prefill:
-                    self.batch.waiting_requests[context.request_id] = self.batch.active_requests.pop(context.request_id)
+                    if not context.request.is_terminal:
+                        self.batch.waiting_requests[context.request_id] = self.batch.active_requests.pop(context.request_id)
+                self.batch.retire()
                 raise
             for context in prefill:
                 view = self.coordinator.get_state(context.request_id)
@@ -109,8 +126,64 @@ class BatchExecutor:
                               tuple(c.request_id for c in prefill), tuple(retired), tuple(results))
 
     def _execute_batch_phase(self, contexts, phase):
+        if not self._managed:
+            return self._apply_batch_phase(contexts, phase)
+        try:
+            if phase is ExecutionPhase.PREFILL:
+                for context in contexts:
+                    if context.request.started_time is None:
+                        context.start()
+                    context.observations.setdefault("prefill_started_time", context.request.started_time)
+            self._apply_batch_phase(contexts, phase)
+        except Exception as original:
+            for context in contexts:
+                if not context.request.is_terminal:
+                    self.coordinator.get_state(context.request_id).fail(str(original))
+            self.batch.retire()
+            errors = self._release(contexts)
+            if errors:
+                original.cleanup_errors = errors
+            raise
+        errors = self._release(c for c in contexts if c.request.is_terminal)
+        if errors:
+            raise ResourceCleanupError(errors)
+
+    def _release(self, contexts):
+        errors = []
+        for context in tuple(contexts):
+            if context.request_id in self._released:
+                continue
+            try:
+                self.batch_worker.release_request(context.request_id)
+                self._released.add(context.request_id)
+            except Exception as error:
+                context.observations.setdefault("cleanup_errors", []).append(str(error))
+                logger.exception("request cleanup failed: %s", context.request_id)
+                errors.append(error)
+        return errors
+
+    def release_terminal(self, request_id=None, *, strict=True):
+        """Retry cleanup without coupling independent requests' progress.
+
+        Per-request acknowledgement/cancellation stays strict. Step preparation
+        records errors but may continue using independent sessions; allocated
+        slots remain owned until the backend confirms release. Close is strict.
+        """
+        self.batch.retire()
+        if self._managed:
+            errors = self._release(c for c in self.coordinator.contexts.values()
+                                   if c.request.is_terminal and (request_id is None or c.request_id == request_id))
+            if errors and strict:
+                raise ResourceCleanupError(errors)
+            return errors
+        return []
+
+    def _apply_batch_phase(self, contexts, phase):
         method = self.batch_worker.prefill_batch if phase is ExecutionPhase.PREFILL else self.batch_worker.decode_batch
         results = list(method(contexts))
+        synchronize = getattr(self.batch_worker, "synchronize", None)
+        if synchronize is not None:
+            synchronize()
         expected = {c.request_id for c in contexts}
         seen = set()
         for result in results:
@@ -125,6 +198,13 @@ class BatchExecutor:
             seen.add(result.request_id)
         if seen != expected:
             raise RuntimeError("batch worker result count mismatch")
+        for context in contexts:
+            result = next(r for r in results if r.request_id == context.request_id)
+            if isinstance(result.error, Exception):
+                context.observations["execution_error"] = result.error
+                if getattr(result.error, "cleanup_errors", None):
+                    context.observations.setdefault("cleanup_errors", []).extend(
+                        str(e) for e in result.error.cleanup_errors)
         batch = self._phase_batch(contexts)
         if phase is ExecutionPhase.DECODE:
             self.coordinator.apply_decode_results(batch, [DecodeStepResult(
@@ -133,7 +213,7 @@ class BatchExecutor:
             ) for r in results])
         else:
             self.coordinator.apply_prefill_results(batch, [PrefillStepResult(
-                r.request_id, 0, False, False,
+                r.request_id, r.prompt_tokens, False, False,
                 r.error if isinstance(r.error, Exception) else RuntimeError(r.error) if r.error is not None else None,
             ) for r in results])
             for result in results:
@@ -168,6 +248,7 @@ class BatchExecutor:
             if not context.request.is_terminal:
                 DecodeStateAdapter(context).cancel()
         self.batch.retire()
+        self.release_terminal()
         self._closed = True
 
     def _require_open(self) -> None:

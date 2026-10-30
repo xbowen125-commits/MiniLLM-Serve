@@ -39,22 +39,26 @@ For a comparable run:
 
 1. Use the same model, CUDA device, FP16 precision, prompt and generation lengths, seed, warmup count, and measured repetition count.
 2. Load and warm the model before steady-state HTTP measurements. Do not include model download or startup in inference latency.
-3. Keep `MINILLM_MAX_CONCURRENT_REQUESTS=1` when comparing with the published HTTP and stress data. Client concurrency may be higher, but that does not increase GPU execution concurrency.
+3. In current source, set `MINILLM_MAX_CONCURRENT_GENERATIONS=1` when comparing with the published HTTP and stress data. Client concurrency may be higher, but that does not increase GPU execution concurrency. The former documentation name `MINILLM_MAX_CONCURRENT_REQUESTS` is not read by current Settings.
 4. Keep KV Cache state explicit and record scheduler queue capacity and timeout settings.
 5. Run the engine benchmark in a separate process when comparing CUDA peak memory, because it resets PyTorch peak statistics for each measured run.
 6. Record laptop power mode, temperatures, and background load separately if tighter repeatability is required; the historical artifacts do not contain that telemetry.
 
 ## Service setup
 
-PowerShell environment matching the published service-side settings:
+Current-source PowerShell recipe for a comparable legacy service, not proof of
+every historical environment assignment. This naming correction does not alter
+the historical artifacts. Formal online GPU Benchmark is still blocked; see
+[current research status](../../docs/research/CURRENT_STATUS.md).
 
 ```powershell
 $env:MINILLM_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+$env:MINILLM_EXECUTION_MODE = "legacy"
 $env:MINILLM_DEVICE = "cuda"
 $env:MINILLM_DTYPE = "float16"
 $env:MINILLM_USE_KV_CACHE = "true"
-$env:MINILLM_MAX_CONCURRENT_REQUESTS = "1"
-$env:MINILLM_QUEUE_CAPACITY = "16"
+$env:MINILLM_MAX_CONCURRENT_GENERATIONS = "1"
+$env:MINILLM_REQUEST_QUEUE_CAPACITY = "16"
 
 .\.venv\Scripts\python.exe -m uvicorn minillm.server:app `
   --host 127.0.0.1 `
@@ -62,7 +66,14 @@ $env:MINILLM_QUEUE_CAPACITY = "16"
   --workers 1
 ```
 
-The raw HTTP artifacts record the running service health and concurrency, but not every scheduler timeout environment variable. Capture `/health` and `/scheduler/status` together with future reports when exact service configuration provenance is required.
+The raw HTTP artifacts record the running service health and concurrency, but not every scheduler timeout environment variable. The former `MINILLM_QUEUE_CAPACITY` name is not read; selecting 16 above is a prospective recipe, not reconstructed missing history. In another terminal, inspect the effective settings:
+
+```powershell
+$s = Invoke-RestMethod http://127.0.0.1:8000/scheduler/status
+$s | Select-Object max_concurrent_requests, queue_capacity, running_requests, queued_requests
+```
+
+Capture `/health` and `/scheduler/status` with separately authorized future reports. Do not rerun commands into historical output paths. These service commands were not executed during the publication remediation.
 
 ## Engine reproduction
 

@@ -9,7 +9,10 @@ from .worker import ContinuousBatchWorkerProtocol
 from .inputs import BatchInputBuilder, BatchModelInput
 from .kv import BatchKVAdapter
 from .paged_worker import PagedContinuousBatchWorker
+from .iteration_scheduler import IterationScheduler
+from .state import IterationState
 
 __all__ = ["ContinuousBatch", "BatchScheduler", "BatchExecutor", "ContinuousStep",
            "ContinuousBatchPlan", "ContinuousBatchStepResult", "ContinuousBatchWorkerProtocol",
-           "BatchInputBuilder", "BatchModelInput", "BatchKVAdapter", "PagedContinuousBatchWorker"]
+           "BatchInputBuilder", "BatchModelInput", "BatchKVAdapter", "PagedContinuousBatchWorker",
+           "IterationScheduler", "IterationState"]

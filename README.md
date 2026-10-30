@@ -1,22 +1,32 @@
 # MiniLLM-Serve
 
-A compact LLM inference service and offline runtime research playground.
+A compact Experimental LLM Serving & Runtime Research Prototype.
 Explore scheduling, prefill/decode execution and KV ownership without hiding
 the mechanics behind a production serving framework.
 
 ## Overview
 
-The project separates two paths:
+**Research status:** Legacy is the default; Continuous HTTP JSON/SSE is an
+opt-in experiment with batch size at most two. Mission 24.4.2.12 found the
+draft evidence contract **INTERNALLY_INCONSISTENT**. Formal online GPU
+Benchmark is **not admitted**; existing PREFLIGHT FAIL/UNKNOWN obligations
+remain open. Read [current research status](docs/research/CURRENT_STATUS.md)
+before using historical evidence or experiment commands.
 
-- **Online serving:** FastAPI, an OpenAI-compatible text Chat Completions subset,
+The project separates three paths:
+
+- **Legacy HTTP (default):** FastAPI, an OpenAI-compatible text Chat Completions subset,
   incremental SSE, handwritten autoregressive decoding, request-local KV cache
   and bounded FIFO admission.
+- **Continuous HTTP (experimental):** the same JSON/SSE API and FIFO admission,
+  one Runtime owner, iteration plans, a CPU/CUDA batch Worker and request KV slots.
 - **Offline research:** model-independent runtime contracts, explicit request
   ownership, continuous decode-step coordination, experimental workers,
   simulated paged KV capacity and reproducible benchmark experiments.
 
 MiniLLM-Serve is an educational engineering project, **not a production vLLM
-replacement**. Offline experiments are not wired into the HTTP inference path.
+replacement**. Simulated paged-memory and Fake Worker performance experiments
+remain separate from actual HTTP/model execution.
 
 Historical online validation used Qwen2.5-0.5B-Instruct on an RTX 5060 Laptop GPU,
 PyTorch 2.11.0+cu128, CUDA 12.8, Transformers 5.17.0 and Accelerate 1.15.0.
@@ -28,13 +38,21 @@ not validate every later experimental backend.
 
 ```mermaid
 flowchart TB
-    subgraph Online[Online serving]
+    subgraph Online[Legacy HTTP - default]
         Client[HTTP client] --> API[FastAPI: JSON or SSE]
         API --> Scheduler[RequestScheduler: FIFO and leases]
         Scheduler --> Engine[GenerationEngine]
         Engine --> Runner[GenerationRunner]
         Runner --> Model[ModelWorker: Transformers forward]
         Runner --> Cache[Request-local DynamicCache]
+    end
+    subgraph Experimental[Continuous HTTP - opt-in]
+        Scheduler --> Owner[Single ContinuousHTTPOwner]
+        Owner --> OnlineFacade[RuntimeFacade - continuous mode]
+        OnlineFacade --> Iteration[IterationScheduler and ContinuousBatchPlan]
+        Iteration --> BatchExec[ContinuousBatchExecutor]
+        BatchExec --> RealBatch[BatchedTransformersWorker - CPU or CUDA]
+        RealBatch --> Slots[SlotKVPool - real request cache references]
     end
     subgraph Offline[Offline runtime research]
         Facade[RuntimeFacade] --> Coordinator[DecodeCoordinator]
@@ -60,20 +78,21 @@ flowchart TB
     Experiments[Benchmark experiments] -. observe .-> Offline
 ```
 
-The offline paths are alternatives, not additional HTTP pipeline stages.
-Synthetic block IDs never enter model attention.
+The execution mode is selected at application startup. These HTTP branches are
+alternatives, not two models loaded for every request. Offline phase executors
+remain available separately. Synthetic block IDs never enter model attention.
 
 ## Features
 
 | Area | Capability | Boundary |
 | --- | --- | --- |
 | API | JSON completions, token usage, incremental SSE and `[DONE]` | Online text subset |
-| Generation | Temperature, top-k/top-p, stop sequences, seeds and length limits | Batch-size-1 online engine |
+| Generation | Temperature, top-k/top-p, stop sequences, seeds and length limits | Legacy engine; experimental batch backend is separately validated |
 | KV cache | Full-prompt prefill, single-token decode, request-local DynamicCache and cache toggle | Online |
 | Request management | FIFO, bounded queues, timeouts, cancellation and shutdown cleanup | Online |
-| Runtime Architecture | Shared contracts, phase validation, context ownership, error isolation and snapshots | Offline |
-| Continuous Batching | Persistent Decode requests, Prefill admission, step plans and batch-worker contracts | Offline coordination |
-| Backend experiments | Sequential Transformers worker and CPU batch adapter limited to two requests | Offline; batch adapter primarily fake-model tested |
+| Runtime Architecture | Shared contracts, context ownership, phase validation and snapshots | Offline facade and opt-in HTTP owner |
+| Continuous Batching | Active Decode requests, new Prefill admission, plans and bounded output channels | Experimental HTTP/offline coordination; batch <= 2 |
+| Backend experiments | Sequential worker, CPU batch adapter and CPU/CUDA BatchedTransformersWorker | Limited full-attention cache layouts; no production-performance claim |
 | KV Memory System | Capacity limits, blocks, logical mappings, token growth and release accounting | Pure Python simulation |
 | Paged KV Runtime | Paged worker decorator and ordered attention block lookup | No paged attention computation |
 | Deployment | Non-root GPU container, one Uvicorn worker, cache volume and readiness check | Online |
@@ -88,17 +107,23 @@ concurrent generation and eight waiting requests. Queue full returns HTTP 429,
 queue timeout 503, and non-streaming inference timeout 504. Once SSE headers
 are sent, failures use error events rather than a new HTTP status.
 
-Inference runs outside the FastAPI event loop: `asyncio.to_thread` for JSON,
-a producer thread and bounded thread-safe queue for SSE. Cancellation is
-cooperative between model steps. **Execution leases remain held until the actual
-worker exits**, because active CUDA kernels cannot be forcibly interrupted.
+Legacy inference runs outside the FastAPI event loop: `asyncio.to_thread` for
+JSON, a producer thread and bounded queue for SSE. Continuous mode uses one
+owner thread for all Runtime commands and forwards, with bounded per-request
+Token channels; it does not create one GPU producer thread per request.
+Cancellation is cooperative at safe model-step boundaries. Legacy leases wait
+for execution to end; Continuous leases additionally require resource cleanup
+and the relevant consumer/finalizer confirmation. A terminal request or empty
+Slot counter alone is not cleanup proof. Active CUDA kernels cannot be forcibly
+interrupted; permanent cleanup failure must not be reported as idle/drained.
 `/health` and `/scheduler/status` expose readiness and aggregate state without
 running inference or publishing prompt content.
 
 ### Runtime Architecture
 
-`RuntimeFacade` provides offline `submit`, `step`, `cancel`, `snapshot`,
-`get_result` and `close`. `RuntimeRequestContext` combines a single authoritative
+`RuntimeFacade` provides `submit`, `step`, `cancel`, `snapshot`, `get_result`,
+acknowledgement/forgetting and `close`, with legacy offline execution and explicit
+continuous mode. The HTTP owner serializes its use. `RuntimeRequestContext` combines a single authoritative
 `RequestState` (lifecycle, generated tokens and options), an execution-only
 `DecodeState` (phase, timestamps and counters), and derived metrics.
 Legacy exports remain adapters rather than independent lifecycle owners.
@@ -110,16 +135,17 @@ decode progress. Execution phases are separate from lifecycle status.
 
 ### Continuous Batching
 
-The offline executor retains unfinished Decode requests and admits waiting
+The continuous executor retains unfinished Decode requests and admits waiting
 Prefill requests into available slots. Stable step plans map results to request
 IDs; one request finishing does not stop its peers.
 
-This is **logical continuous batch coordination**, not production GPU continuous
-batching. The experimental `TransformersBatchWorker` supports CPU batches of
-at most two requests using basic K/V concatenation and cloned row splitting.
-It is correctness scaffolding, not an optimized cache layout, and is not
-connected to HTTP. The existing `TransformersWorker` remains a separate
-sequential-request backend.
+`TransformersBatchWorker` supplies the CPU scaffolding; `BatchedTransformersWorker`
+adds CPU/CUDA execution and SlotKVPool, and is used by the experimental HTTP
+owner. Both are limited to batches of at most two and basic K/V concatenation,
+padding and cloned row splitting. This is not an optimized production cache
+layout. The separate `TransformersWorker` remains a sequential backend.
+Historical offline, ASGI and real TCP/CUDA checks have distinct scopes; they
+do not close the evidence-contract findings or authorize online performance runs.
 
 ### KV Memory System and Paged KV Runtime
 
@@ -143,6 +169,8 @@ waiting under arbitrary sustained load.
 
 ## Quick Start
 
+<a id="quick-start-with-docker-compose"></a>
+
 ### Docker Compose — Windows PowerShell
 
 Requires Docker Desktop with Linux containers and WSL2, an NVIDIA driver with
@@ -162,6 +190,9 @@ Default address: **`127.0.0.1:8000`**. Compose selects Qwen2.5-0.5B-Instruct,
 CUDA FP16 and one Uvicorn worker. Additional workers load independent models and
 schedulers. The container uses `/opt/venv` and reuses the base CUDA PyTorch.
 Change `MINILLM_HOST_PORT` in `.env` if needed.
+The shipped Compose environment selects legacy behavior. It does not forward
+the Continuous mode settings or use the special early-shutdown launcher;
+Continuous-container deployment is not claimed validated.
 
 First startup may download the public model into the persistent
 `minillm-hf-cache` volume. Tokens belong only in the runtime environment;
@@ -206,22 +237,88 @@ docker compose down
 
 ### Local development
 
-Metadata requires Python 3.10+; Docker and CI target Python 3.12. For a new
-environment, install the appropriate CPU/CUDA PyTorch build before
-`python -m pip install -e ".[dev]"`. Preserve an existing `.venv`.
+Metadata requires Python 3.10+; Docker and CI target Python 3.12. The following
+is a **new-clone CPU setup**, not a command to replace an existing CUDA setup:
+
+```powershell
+git clone https://github.com/xbowen125-commits/MiniLLM-Serve.git
+Set-Location MiniLLM-Serve
+if (Test-Path .venv) { throw "Existing .venv: preserve it and skip new-environment installation." }
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+.\.venv\Scripts\python.exe -m pip install --constraint constraints-container.txt -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip check
+```
+
+These installation commands were reviewed statically, not executed during this
+remediation. Preserve an existing `.venv`; do not run the CPU installation over
+a working CUDA environment. CUDA users need an appropriate pre-existing CUDA
+PyTorch build. The pinned Docker/CI environment uses Transformers 5.17.0;
+later local Qwen CUDA correctness records use 5.19.0/float32. See the
+[environment matrix](docs/research/PUBLICATION_REMEDIATION.md#environment-matrix).
+
+Local settings read process environment variables; `.env` is a Compose input,
+not an automatically loaded local configuration file. Start a **legacy** service
+only with the model already cached for the following offline example:
 
 ```powershell
 $env:MINILLM_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-$env:MINILLM_DEVICE = "cuda"
-$env:MINILLM_DTYPE = "float16"
+$env:MINILLM_EXECUTION_MODE = "legacy"
+$env:MINILLM_DEVICE = "cpu" # Use cuda only in a validated CUDA environment.
+$env:MINILLM_DTYPE = "float32"
 $env:MINILLM_USE_KV_CACHE = "true"
+$env:MINILLM_MAX_CONCURRENT_GENERATIONS = "1"
+$env:MINILLM_REQUEST_QUEUE_CAPACITY = "8"
+$env:HF_HUB_OFFLINE = "1"
+$env:TRANSFORMERS_OFFLINE = "1"
 .\.venv\Scripts\python.exe -m uvicorn minillm.server:app --host 127.0.0.1 --port 8000
 ```
+
+For **experimental Continuous JSON/SSE**, stop the previous process, then run
+in a fresh PowerShell session (same cached model and existing environment):
+
+```powershell
+$env:MINILLM_EXECUTION_MODE = "continuous"
+$env:MINILLM_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+$env:MINILLM_DEVICE = "cpu" # Or cuda with an existing CUDA build; not a benchmark.
+$env:MINILLM_DTYPE = "float32"
+$env:MINILLM_HOST = "127.0.0.1"
+$env:MINILLM_PORT = "8000"
+$env:MINILLM_USE_KV_CACHE = "true"
+$env:MINILLM_MAX_CONCURRENT_GENERATIONS = "2"
+$env:MINILLM_CONTINUOUS_BATCH_SIZE = "2"
+$env:MINILLM_REQUEST_QUEUE_CAPACITY = "8"
+$env:MINILLM_CONTINUOUS_OUTPUT_CAPACITY = "8"
+$env:HF_HUB_OFFLINE = "1"
+$env:TRANSFORMERS_OFFLINE = "1"
+.\.venv\Scripts\python.exe -m minillm.continuous_server
+```
+
+From another terminal, verify the effective admission settings rather than
+assuming an environment-variable assignment took effect:
+
+```powershell
+$s = Invoke-RestMethod http://127.0.0.1:8000/scheduler/status
+$s | Select-Object max_concurrent_requests, queue_capacity, running_requests, queued_requests
+$s.continuous | ConvertTo-Json -Depth 6 # Present only in continuous mode.
+```
+
+The current names are `MINILLM_MAX_CONCURRENT_GENERATIONS` and
+`MINILLM_REQUEST_QUEUE_CAPACITY`; older `MINILLM_MAX_CONCURRENT_REQUESTS` and
+`MINILLM_QUEUE_CAPACITY` names are not read. Mode changes require restart.
+To roll back, stop the Continuous process, select `legacy` with admission 1,
+and use the legacy launcher above. Shutdown may wait for actual execution and
+cleanup; these examples do not claim a new service/GPU acceptance run.
 
 Application model default is Qwen2.5-1.5B-Instruct, unlike Compose. Configuration
 references: [.env.example](.env.example) and [config.py](src/minillm/config.py).
 
 ## Benchmarks
+
+**Formal online GPU Benchmark remains blocked.** Historical reproduction
+commands are not permission to run a new performance experiment. Read
+[current restrictions](docs/research/CURRENT_STATUS.md) and the
+[Paged Memory source-hash erratum](docs/research/PAGED_MEMORY_PROVENANCE_ERRATUM.md).
 
 | Experiment | Measurement scope | Documentation / entry point |
 | --- | --- | --- |
@@ -233,12 +330,17 @@ references: [.env.example](.env.example) and [config.py](src/minillm/config.py).
 | Continuous batch | Sequential vs step-level coordination under virtual costs | [Runner](benchmarks/runtime/continuous_batch/runner.py) |
 | Scheduler research | FIFO vs phase priority vs aging, wait percentiles and fairness | [Runner](benchmarks/runtime/scheduler_research/runner.py) |
 
-Run the latest simulations without loading a model:
+For separately authorized simulations, choose a fresh output directory instead
+of overwriting the historical default locations. These commands were reviewed,
+not executed during the publication remediation; they load no model:
 
 ```powershell
-.\.venv\Scripts\python.exe -m benchmarks.runtime.paged_memory.report
-.\.venv\Scripts\python.exe -m benchmarks.runtime.continuous_batch.report
-.\.venv\Scripts\python.exe -m benchmarks.runtime.scheduler_research.report
+$out = "benchmarks/runtime/results/manual-simulation-$([guid]::NewGuid().ToString('N'))"
+if (Test-Path $out) { throw "Output already exists: choose a new path." }
+New-Item -ItemType Directory -Path $out -ErrorAction Stop | Out-Null
+.\.venv\Scripts\python.exe -m benchmarks.runtime.paged_memory.report --output-dir "$out/paged-memory"
+.\.venv\Scripts\python.exe -m benchmarks.runtime.continuous_batch.report --output-dir "$out/continuous-batch"
+.\.venv\Scripts\python.exe -m benchmarks.runtime.scheduler_research.report --output-dir "$out/scheduler-research"
 ```
 
 JSON and Markdown are written under Git-ignored `benchmarks/runtime/results/`.
@@ -258,14 +360,22 @@ establish current-revision production capacity.
 ## Testing
 
 ```powershell
-.\.venv\Scripts\python.exe -m compileall -q src tests benchmarks
-.\.venv\Scripts\python.exe -m pytest -m "not slow" -q
+$env:CUDA_VISIBLE_DEVICES = "-1"
+$env:MINILLM_DEVICE = "cpu"
+$env:MINILLM_DTYPE = "float32"
+$env:MINILLM_EXECUTION_MODE = "legacy"
+$env:HF_HUB_OFFLINE = "1"
+$env:TRANSFORMERS_OFFLINE = "1"
+.\.venv\Scripts\python.exe -B -m pytest -m "not slow" -q
 ```
 
-Last local check before this documentation-only update: **333 passed,
-9 deselected**. This is not a claim that the README update was retested or that
-GitHub-hosted CI passed. CI configures CPU PyTorch on Ubuntu/Python 3.12;
-current hosted-run status requires independent verification.
+Run from the repository root. Use a fresh shell before any separately authorized
+GPU work because `CUDA_VISIBLE_DEVICES=-1` persists in this shell. The older
+333-passed/9-deselected figure describes a historical checkpoint, not this
+candidate. Actual remediation checks and their source/environment limits are
+recorded in [local validation](docs/research/PUBLICATION_REMEDIATION.md).
+CI configures CPU PyTorch on Ubuntu/Python 3.12; current hosted-run status
+requires independent verification and is not certified by a local run.
 
 Normal tests use mocks or small tensors without downloading models. Opt-in
 real-model tests require a complete local cache; see
@@ -294,24 +404,34 @@ scripts/                          Smoke and generation helpers
 
 ## Limitations
 
-- Offline research is not connected to online serving; online requests use
-  separate handwritten batch-size-1 decode loops.
-- No real GPU continuous batching, paged attention kernel, prefix sharing,
+- Legacy is the default batch-size-1 generation path; experimental Continuous
+  HTTP is opt-in and limited to two admitted requests and two cache slots.
+- No production-grade continuous batching, paged attention kernel, prefix sharing,
   tensor parallelism or multi-GPU execution.
 - Simulated block capacity is not GPU allocation; block lookup is not attention.
-- Experimental CPU batching supports at most two requests and limited cache layouts.
+- Experimental batched backends support at most two requests and limited cache layouts.
 - Text-only Chat Completions subset: no tools, multimodal input, logprobs or
   streaming usage object.
 - Cooperative cancellation cannot stop active CUDA kernels immediately.
+- Permanent cleanup failure can prevent drain; bounded tests do not prove
+  unconditional cleanup termination or all Runtime interleavings.
+- The draft evidence contract is INTERNALLY_INCONSISTENT and formal online GPU
+  Benchmark admission is blocked; see the current research status above.
 - No built-in authentication or TLS. Keep loopback binding and secure external exposure.
 - In-memory metrics reset on restart. Laptop samples and finite simulations do
   not establish production throughput, starvation freedom or long-run reliability.
 
 ## Roadmap
 
+Already implemented experimental HTTP JSON/SSE is described above, not promised
+as future work. Historical [SSE/network correctness evidence](docs/continuous_sse_validation.md)
+and [integration notes](docs/http_continuous_integration.md) retain their dated
+scope; later research restrictions take precedence over earlier next-mission
+recommendations. The following items remain research directions:
+
 - Broaden experimental backend compatibility and real-model batch correctness evidence.
 - Record source revisions and expand reproducible runtime workloads.
-- Study token budgets, cache pressure and fairness before online integration.
+- Study token budgets, cache pressure and fairness before broader online integration.
 - Explore actual paged tensor layouts and attention backends separately from bookkeeping.
 - Add longer soak tests, structured tracing and hardened deployment examples.
 - Consider broader API compatibility and multi-GPU work after lifecycle correctness.

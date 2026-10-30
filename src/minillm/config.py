@@ -43,8 +43,21 @@ class Settings:
     inference_timeout_seconds: float = field(
         default_factory=lambda: float(_env("MINILLM_INFERENCE_TIMEOUT_SECONDS", "120"))
     )
+    execution_mode: str = field(default_factory=lambda: _env("MINILLM_EXECUTION_MODE", "legacy"))
+    continuous_batch_size: int = field(default_factory=lambda: int(_env("MINILLM_CONTINUOUS_BATCH_SIZE", "2")))
+    continuous_output_capacity: int = field(default_factory=lambda: int(_env("MINILLM_CONTINUOUS_OUTPUT_CAPACITY", "8")))
+    continuous_send_timeout_seconds: float = field(default_factory=lambda: float(_env("MINILLM_CONTINUOUS_SEND_TIMEOUT_SECONDS", "10")))
 
     def __post_init__(self) -> None:
+        if self.execution_mode not in {"legacy", "continuous"}:
+            raise ValueError("MINILLM_EXECUTION_MODE must be legacy or continuous")
+        if self.execution_mode == "continuous":
+            if self.continuous_output_capacity < 1 or self.continuous_send_timeout_seconds <= 0:
+                raise ValueError("continuous output capacity and send timeout must be positive")
+            if not self.use_kv_cache:
+                raise ValueError("continuous mode requires KV cache")
+            if not 1 <= self.max_concurrent_generations <= self.continuous_batch_size <= 2:
+                raise ValueError("continuous admission <= batch size <= 2 is required")
         if self.max_concurrent_generations < 1:
             raise ValueError("MINILLM_MAX_CONCURRENT_GENERATIONS 必须 >= 1")
         if self.request_queue_capacity < 0:

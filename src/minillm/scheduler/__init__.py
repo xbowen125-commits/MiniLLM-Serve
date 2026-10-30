@@ -68,6 +68,7 @@ class SchedulerLease:
         self.request_id = request_id
         self.queue_wait_seconds = queue_wait_seconds
         self.request_state = request_state
+        self.admitted_at = time.monotonic()
         self.cancel_event = threading.Event()
         self._released = False
 
@@ -93,6 +94,7 @@ class RequestScheduler:
         inference_timeout_seconds: float,
         max_batch_size: int = 4,
         phase_policy: PhaseAwareBatchPolicy | None = None,
+        external_lifecycle: bool = False,
     ) -> None:
         if max_running < 1:
             raise ValueError("max_running must be at least 1")
@@ -111,6 +113,7 @@ class RequestScheduler:
         self.inference_timeout_seconds = inference_timeout_seconds
         self.max_batch_size = max_batch_size
         self.phase_policy = phase_policy
+        self.external_lifecycle = external_lifecycle
 
         self._lock = asyncio.Lock()
         self._waiters = RequestQueue(queue_capacity)
@@ -220,8 +223,12 @@ class RequestScheduler:
                 "shutting_down": self._closed,
             }
 
-    async def close(self) -> None:
-        """Reject queued work, cancel running work, and wait for real cleanup."""
+    async def begin_shutdown(self) -> None:
+        """Stop admission and signal cancellation, without waiting for consumers.
+
+        Network servers must call this before awaiting open streaming handlers.
+        Repeated calls are safe; leases remain until their real finalizers run.
+        """
         async with self._lock:
             if not self._closed:
                 self._closed = True
@@ -239,6 +246,9 @@ class RequestScheduler:
             if not self._running:
                 self._idle.set()
 
+    async def close(self) -> None:
+        """Reject queued work, cancel running work, and wait for real cleanup."""
+        await self.begin_shutdown()
         # There is intentionally no forced slot release here.  The request
         # handlers release leases only after their worker thread has exited.
         await self._idle.wait()
@@ -263,7 +273,8 @@ class RequestScheduler:
         now: float,
     ) -> SchedulerLease:
         wait_seconds = max(0.0, now - enqueued_at)
-        request_state.mark_running()
+        if not self.external_lifecycle:
+            request_state.mark_running()
         lease = SchedulerLease(self, request_id, wait_seconds, request_state)
         self._running[request_id] = lease
         self._accepted += 1

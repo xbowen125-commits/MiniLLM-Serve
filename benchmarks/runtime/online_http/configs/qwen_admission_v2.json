@@ -1,0 +1,113 @@
+{
+  "protocol_version": 1,
+  "name": "qwen-float32-cuda-http-authoritative-v2",
+  "evidence_kind": "real_gpu",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "model_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "tokenizer_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "dtype": "float32",
+  "device": "cuda",
+  "stream": true,
+  "max_client_concurrency": 6,
+  "max_requests": 6,
+  "max_model_len": 2048,
+  "admission_limit": 2,
+  "queue_capacity": 8,
+  "queue_timeout_s": 30,
+  "inference_timeout_s": 120,
+  "request_timeout_s": 180,
+  "drain_timeout_s": 60,
+  "startup_timeout_s": 180,
+  "poll_interval_s": 0.05,
+  "warmup_requests": 2,
+  "pairs": 10,
+  "seed": 42,
+  "temperature": 0,
+  "top_p": 1,
+  "top_k": -1,
+  "stop": null,
+  "output_capacity": 8,
+  "send_timeout_s": 10,
+  "arrival_tolerance_ms": 25,
+  "max_run_seconds": 600,
+  "telemetry_interval_s": 0.05,
+  "slo": {
+    "ttft_ms": 5000,
+    "e2e_ms": 15000,
+    "tpot_ms": 500
+  },
+  "requests": [
+    {
+      "request_id": "short-01",
+      "arrival_s": 0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "请用一句话解释什么是机器学习。"
+        }
+      ],
+      "max_tokens": 16
+    },
+    {
+      "request_id": "long-01",
+      "arrival_s": 0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "A local inference service receives short and long text-generation requests. Describe how queueing delay, time to first token, per-request latency and total completed output tokens differ. Use concise language and do not invent performance measurements."
+        }
+      ],
+      "max_tokens": 48
+    },
+    {
+      "request_id": "short-02",
+      "arrival_s": 0.25,
+      "messages": [
+        {
+          "role": "user",
+          "content": "List three primary colors."
+        }
+      ],
+      "max_tokens": 16
+    },
+    {
+      "request_id": "mixed-01",
+      "arrival_s": 0.5,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer accurately and concisely."
+        },
+        {
+          "role": "user",
+          "content": "Explain why two runs with identical request arrivals can still have different actual dispatch times under a client concurrency limit."
+        }
+      ],
+      "max_tokens": 32
+    },
+    {
+      "request_id": "long-02",
+      "arrival_s": 0.75,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain the following experimental controls in a short paragraph: the same model revision and tokenizer; fixed greedy generation; the same prompt texts; a fixed arrival trace; predeclared latency SLOs; separate warmup and drain phases; retained failures and anomalous samples."
+        }
+      ],
+      "max_tokens": 48
+    },
+    {
+      "request_id": "short-03",
+      "arrival_s": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "用一句话说明为什么测试失败记录也需要保留。"
+        }
+      ],
+      "max_tokens": 16
+    }
+  ],
+  "authoritative_sse_usage": true,
+  "warmup_strategy": "sequential_and_pairs"
+}
