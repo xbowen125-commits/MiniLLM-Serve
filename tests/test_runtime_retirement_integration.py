@@ -182,11 +182,31 @@ def test_owner_admission_finalization_and_retry(trace_directory, mode, monkeypat
             leases = list(app.state.request_scheduler._running.values())
             first_lease = leases[0]
             assert first_lease.request_state is refs[target[0]]
+            if mode == "decode_error":
+                from minillm.batching.coordinator import DecodeCoordinator
+                failed_decode_applied = asyncio.Event()
+                loop = asyncio.get_running_loop()
+                apply_decode_results = DecodeCoordinator.apply_decode_results
+
+                def observe_failed_decode(coordinator, batch, results):
+                    target_failure = any(request is first_lease.request_state for request in batch.requests) and any(
+                        result.request_id == first_lease.request_state.request_id and result.error is not None
+                        for result in results)
+                    retired = apply_decode_results(coordinator, batch, results)
+                    if target_failure:
+                        loop.call_soon_threadsafe(failed_decode_applied.set)
+                    return retired
+
+                monkeypatch.setattr(DecodeCoordinator, "apply_decode_results", observe_failed_decode)
             if mode != "decode_error":
                 disconnect.set()
                 await until(first_lease.cancel_event.is_set)
             resume_prefill.set()
             await until(attempted.is_set)
+            if mode == "decode_error":
+                # Cleanup can be attempted before the Worker returns its result.
+                # Wait for the real Coordinator application, not a pending count.
+                await asyncio.wait_for(failed_decode_applied.wait(), 5)
             await until(lambda: evidence["owner"].status().get("pending") == 1)
             worker = evidence["worker"]
             original = refs[target[0]]
