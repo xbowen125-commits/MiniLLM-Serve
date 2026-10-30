@@ -37,3 +37,25 @@ models
 **/*.pfx
 .aws
 .ssh
+
+# Private evidence may live outside benchmarks; never include it in build context.
+**/private-evidence
+**/private_evidence
+**/tensor-sidecars
+**/.tensor-sidecars
+**/credentials
+**/secrets
+**/.aws
+**/.ssh
+**/credentials.json
+**/secrets.json
+**/*.npy
+**/*.npz
+**/*.pkl
+**/*.pickle
+**/*.ckpt
+**/*.tensor
+**/*.tensorpack
+results
+artifacts
+logs

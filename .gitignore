@@ -28,6 +28,32 @@ models/
 *.pth
 *.gguf
 
+# Private observations and tensor sidecars are not publication assets.
+private-evidence/
+private_evidence/
+tensor-sidecars/
+.tensor-sidecars/
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.ckpt
+*.tensor
+*.tensorpack
+
+# Credentials and local output outside the benchmark-specific directories.
+.aws/
+.ssh/
+credentials/
+secrets/
+token
+tokens
+credentials.json
+secrets.json
+/results/
+/artifacts/
+/logs/
+
 # Common private-key and local-editor files.
 *.pem
 *.key
