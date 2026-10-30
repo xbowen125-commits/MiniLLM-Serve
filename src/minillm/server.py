@@ -523,18 +523,42 @@ def create_app(settings: Optional[Settings] = None, *, continuous_owner_factory=
             else:
                 drain = asyncio.create_task(scheduler.close())
                 stopped = asyncio.wrap_future(owner.stopped)
-                done, _ = await asyncio.wait((drain, stopped), return_when=asyncio.FIRST_COMPLETED)
-                if stopped in done:
-                    drain.cancel()
-                    await asyncio.gather(drain, return_exceptions=True)
-                    # A dead owner cannot run further finalizers. Propagate its
-                    # failure; retained leases explicitly remain non-idle.
-                    await stopped
-                await drain
+                # This wrapper may outlive an externally cancelled shutdown.
+                # Observe eventual errors without cancelling the Owner's Future.
+                stopped.add_done_callback(
+                    lambda future: None if future.cancelled() else future.exception()
+                )
+                shutdown_error = None
+                try:
+                    done, _ = await asyncio.wait((drain, stopped), return_when=asyncio.FIRST_COMPLETED)
+                    if stopped in done:
+                        # Owner failure prevents further finalizers; propagate it.
+                        # Normal completion still requires actual Lease drain.
+                        await stopped
+                    await drain
+                except BaseException as exc:
+                    shutdown_error = exc
+                    raise
+                finally:
+                    # Only retire our auxiliary task on failure/cancellation;
+                    # never re-await an internally cancelled drain as success.
+                    if not drain.done():
+                        drain.cancel()
+                    drain_error, = await asyncio.gather(drain, return_exceptions=True)
+                    if (isinstance(drain_error, BaseException)
+                            and not isinstance(drain_error, asyncio.CancelledError)
+                            and drain_error is not shutdown_error):
+                        logger.error(
+                            "secondary scheduler drain failure during shutdown",
+                            exc_info=(type(drain_error), drain_error, drain_error.__traceback__),
+                        )
             if cleanup_tasks:
                 await asyncio.gather(*cleanup_tasks, return_exceptions=True)
             if owner is not None:
-                await asyncio.wrap_future(owner.close())
+                owner.close()
+                # Cancellation belongs to the caller, not the Owner's state.
+                # Reuse the observed wrapper; do not create an unobserved one.
+                await asyncio.shield(stopped)
                 await asyncio.to_thread(owner.thread.join)
 
     app = FastAPI(
