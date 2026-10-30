@@ -20,7 +20,11 @@ define fixed controls, metrics, artifact scope and limitations. The frozen input
 are [CPU/Fake smoke](../benchmarks/runtime/online_http/configs/smoke.json) and
 [future Qwen CUDA protocol](../benchmarks/runtime/online_http/configs/qwen_protocol.json).
 
-## Audit evidence motivating a separate framework
+## Historical audit evidence motivating a separate framework
+
+The following table records the original Mission 24.4.1 observations, not a
+complete description of the current benchmark host. Historical artifacts retain
+these limitations. See the current clarification below before interpreting new data.
 
 | Existing behavior | Consequence for the frozen protocol |
 | --- | --- |
@@ -39,6 +43,31 @@ Sources: [existing HTTP benchmark](../benchmarks/benchmark_http.py),
 [single runtime owner](../src/minillm/runtime/http_owner.py) and
 [prior TCP correctness report](continuous_sse_validation.md).
 
+## Current implementation clarification (Mission 24.4.2.45)
+
+`minillm.usage` is an opt-in **Benchmark host extension**, installed by
+`benchmarks/runtime/online_http/server.py` through `usage.install(app)` and
+requested with `X-MiniLLM-Benchmark-Usage: 1`. Ordinary application responses and
+the standard chat schema remain unchanged. The named event precedes `[DONE]`
+when deliverable and carries terminal metadata, never chat content.
+
+Generated counts require validation of response/lease/engine-request identity,
+terminal state, source and inclusion semantics. The source is the terminal
+RequestState token list, including generated EOS, stop and hidden tokens present
+in that list. Usage does not supply per-generated-token timestamps or prove
+resource retirement. A disconnected client may receive no final usage event;
+an identity-bound terminal journal is needed for out-of-band accounting, otherwise
+the count remains unknown. Visible-text retokenization is never a substitute.
+
+The [metric evidence contract v1](online_benchmark_metric_contract_v1.md) specifies
+current behavior, proposed future checks and missing evidence separately. It is
+not a claim that every specified negative check is already implemented. Missing,
+duplicate, malformed or conflicting required usage must preserve raw evidence
+and explicit diagnostics rather than manufacture a valid count or zero.
+No historical artifact is retroactively upgraded. Existing admission gates and
+the frozen **25 ms** dispatch-lateness threshold remain unchanged; formal online
+GPU Benchmark remains **NOT_ADMITTED**.
+
 ## Fixed experimental contract
 
 Both modes use the same immutable model/tokenizer revisions, messages, dtype,
@@ -53,8 +82,13 @@ shutdown are timed separately. Only the measured replay window contributes to
 formal completed rates. The same frozen SLO thresholds apply to every trial;
 changing thresholds or any control requires a new configuration hash.
 
-Warmups cycle through preflight-valid frozen trace entries using separate IDs,
-one client and phase-labelled raw rows. Startup, per-request absolute deadlines,
+The original sequential warmups cycled through preflight-valid frozen trace
+entries using separate IDs, one client and phase-labelled raw rows. Current
+`warmup.py` also supports `sequential_and_pairs`; `qwen_admission_v2.json`
+selects it, adding request-pair groups after individual requests. Pair dispatch
+does not prove actual GPU batch=2 or complete prefill/decode Tensor and KV shape
+coverage. Existing shape-evidence gates remain unchanged.
+Startup, per-request absolute deadlines,
 replay budget, resource drain and shutdown grace have separate scopes; no claim
 is made that `max_run_seconds` covers all model loads and all pairs. An unconfirmed
 server stop aborts subsequent process launches instead of force-killing and
@@ -80,10 +114,11 @@ client, not the Runtime first Token timestamp. Visible TPOT is the first-to-last
 content interval divided by retokenized visible count minus one. End-to-end
 latency includes the final transport event. Chunks are never treated as Tokens.
 
-Generated counts are accepted only from server usage. With current SSE, those
-counts and true per-Token/internal execution timing are N/A. Visible-text rates
-remain explicitly labelled proxies. This is a deliberate observability gap, not
-permission to equate visible and generated Tokens. Per-request token limits are
+Generated counts are accepted only from validated server usage. The opt-in
+benchmark SSE extension can provide terminal counts; ordinary SSE and historical
+artifacts without that evidence keep those counts N/A. True per-Token/internal
+execution timing is not supplied by usage. Visible-text rates remain explicitly
+labelled proxies, never generated-token substitutes. Per-request token limits are
 not assumed to be exact generation lengths because EOS and stop may finish early.
 
 GPU/KV lifetime peaks include warmup; periodically sampled measured maxima may
@@ -97,14 +132,17 @@ retention, protocol and reporting, but not real CUDA concurrency or speed.
 2. Verify local cached immutable revisions and actual dtype/device.
 3. Run a bounded legacy-versus-continuous greedy correctness preflight at the
    same admission limit, including concurrent legacy CUDA execution.
-4. Acknowledge that actual streamed generated counts, exact interval memory
-   peaks and Runtime execution timestamps remain unavailable with the current API.
+4. Validate opt-in authoritative streamed counts when required; preserve unknown
+   counts otherwise. Usage does not establish exact interval memory peaks or
+   Runtime per-token execution timestamps. Apply the versioned metric contract
+   without changing existing admission requirements.
 5. Retain every trial, phase, raw record, process identity and dirty-source hash.
 6. Check dispatch lateness, pair consistency and final resources before drawing
    any configuration-specific conclusion. Do not claim universal speedup.
 
-The current fixed warmups use one client and cycle through valid trace entries;
-they do not prove that every concurrent GPU batch shape is fully warmed. Review
+The original frozen sequential recipe used one client. The current admission
+configuration's `sequential_and_pairs` recipe adds concurrent pairs, but neither
+recipe alone proves that every required GPU execution shape is warmed. Review
 that coverage in a separately authorized preflight before accepting formal GPU
 results. Changing a warmup rule requires a new frozen configuration/protocol,
 never relabelling old measurements as already warmed.

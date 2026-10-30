@@ -20,6 +20,24 @@ See the [protocol freeze](../../../docs/online_benchmark_protocol.md),
 [cross-process replication](../../../docs/gpu_cross_session_replication.md).
 Those older experiments have different scopes and are not new online samples.
 
+## Current opt-in accounting and versioned semantics
+
+The benchmark host installs `usage.install(app)`; clients explicitly send
+`X-MiniLLM-Benchmark-Usage: 1`. A named `minillm.usage` event before `[DONE]`
+contains terminal metadata, not standard chat content. Ordinary HTTP responses
+and the default chat schema are unchanged. Validated counts come from the
+terminal RequestState token list, including generated EOS/stop/hidden tokens;
+they are separate from final visible-text retokenization. Disconnects may prevent
+delivery, so an unknown count stays unknown unless independently journaled and
+identity-bound. An event is not proof of KV retirement.
+
+See [metric evidence contract v1](../../../docs/online_benchmark_metric_contract_v1.md)
+for proposed field names, validation rules, memory scope and negative cases.
+Existing `ttft_ms` and `tpot_ms` keep their meanings: client-visible TTFT and
+visible-text TPOT proxy. Usage adds no per-token timing. This specification does
+not implement new checks or grant admission; historical outputs retain their
+original schema and evidence. The 25 ms lateness gate remains frozen.
+
 ## Frozen controls
 
 `configs/smoke.json` is a bounded CPU/Fake TCP check, including an intentional
@@ -85,8 +103,12 @@ client terminal observations, but exclude startup, warmup and post-request drain
 Warmup is journaled with its own phase label. Never merge rows by a wildcard over
 old directories or pool warmup, prior experiments and formal samples together.
 
-Warmup requests cycle through preflight-valid entries in the frozen trace, in
-trace order, using a single client and warmup-only IDs. They are not synthesized
+The original sequential warmup cycled through preflight-valid entries in trace
+order using a single client and warmup-only IDs. Current `warmup.py` supports
+`sequential_and_pairs`, selected by `configs/qwen_admission_v2.json`: individual
+requests are followed by request-pair groups. Pairs do not independently prove
+actual GPU batch=2 or complete prefill/decode Tensor and KV shape coverage.
+Warmup inputs are not synthesized
 as different prompts, and the fake fixture's intentionally invalid input is not
 used to pretend a successful warmup. Formal replay still retains that failed input.
 
@@ -137,9 +159,10 @@ arrival-to-send lateness is separately retained.
 Receipt timestamps are captured by the HTTP observer, not a packet capture.
 Socket/JSON work and client scheduling are part of these measurements. The
 tokenizer confirms first visible content and retokenizes final text; it does not
-retokenize every prefix after the first event. Prompt counts in SSE rows are
-labelled `pinned_tokenizer_chat_template_preflight`, not invented server usage.
-JSON usage has `prompt_count_source=server_usage`.
+retokenize every prefix after the first event. SSE prompt counts without
+authoritative prompt usage retain `pinned_tokenizer_chat_template_preflight`;
+validated opt-in usage can supply `prompt_count_source=server_usage`.
+JSON usage also uses `server_usage`.
 
 SLO thresholds are mandatory configuration values established before execution.
 Missing required observations fail SLO qualification rather than being invented;
@@ -149,12 +172,13 @@ after reading outcomes to improve reported goodput.
 
 ### Explicit observability gaps
 
-The current Chat API SSE schema exports neither actual generated Token IDs nor
-usage. Thus streamed `G_i`, true internal-token TPOT and Runtime per-request
-execution TTFT/TPOT/E2E are **N/A**. Retokenized visible counts can omit EOS,
-special or stop tokens and can differ from the generated sequence. Non-streaming
-JSON usage is authoritative for `G_i`; do not mix that rate with an SSE proxy.
-The protocol preserves this gap rather than changing production API semantics.
+Ordinary Chat API SSE has no benchmark usage extension or generated Token IDs.
+The opt-in benchmark host can supply validated terminal `G_i`, but not exact
+internal-token TPOT or Runtime per-request execution timestamps. Without that
+evidence the corresponding fields remain **N/A**. Visible counts can omit EOS,
+special or stop tokens and differ from generation. JSON usage and validated
+benchmark usage are separate from visible proxies; historical missing counts
+are never backfilled. Default production API semantics are unchanged.
 
 The status endpoint exposes process-lifetime CUDA allocation peaks and owner KV
 slot peaks. These include model startup and warmup; they are not exact formal
@@ -285,12 +309,16 @@ directory. A fresh output directory is mandatory for every retry.
 `gate.py` enforces the fixed 25ms tolerance, complete request records, expected
 outputs, successful drain/shutdown and process-local warmup proof. Logical
 batch sizes alone are insufficient: input/mask/KV-length tensor shape coverage
-must be attested. The frozen sequential warmup cannot establish Continuous B=2
-coverage. Diagnostic B=2 probes are not warmup of a future process.
+must be attested. The original sequential warmup cannot establish Continuous B=2
+coverage; current paired dispatch alone cannot establish it either. Actual
+forward observations and complete required-shape evidence remain necessary.
+Diagnostic B=2 probes are not warmup of a future process.
 
-The current streaming protocol also lacks authoritative generated-token usage.
-It therefore remains **blocked for formal performance statistics**, even if a
-future correctness report otherwise passes. `formal_statistics` stays null;
+The original streaming configuration lacked authoritative generated-token usage.
+Later opt-in accounting does not close the remaining identity, shape and
+evidence obligations. Formal performance statistics remain **blocked** until
+all existing admission checks pass. No new admission is granted here;
+`formal_statistics` remains null for blocked runs;
 raw diagnostic summaries and rejected records are still retained. Visible-text
 proxy eligibility never substitutes for generated-token eligibility. Deliberate
 fault probes have `performance_sample=false` and cannot enter formal samples.
